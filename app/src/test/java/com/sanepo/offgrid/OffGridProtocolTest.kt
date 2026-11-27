@@ -221,4 +221,11 @@ class OffGridProtocolTest {
         assertEquals(OffGridProtocol.GATT_TYPE_AUDIO, parsed[1].first)
         assertArrayEquals(payloadB, parsed[1].second)
     }
+
+    @Test
+    fun apkHeaderValidationRejectsHtmlAndAcceptsValidApkSize() {
+        assertTrue(AppUpdateManager.isValidApkHeaderAndSize(byteArrayOf(0x50, 0x4B, 0x03, 0x04), 4, 890_000L))
+        assertFalse(AppUpdateManager.isValidApkHeaderAndSize("<!DO".toByteArray(), 4, 890_000L))
+        assertFalse(AppUpdateManager.isValidApkHeaderAndSize(byteArrayOf(0x50, 0x4B, 0x03, 0x04), 4, 25_000L))
+    }
 }

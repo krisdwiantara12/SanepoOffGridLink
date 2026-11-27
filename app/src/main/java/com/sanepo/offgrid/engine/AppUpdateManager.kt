@@ -1,23 +1,18 @@
 package com.sanepo.offgrid.engine
 
-import android.app.DownloadManager
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
-import android.os.Handler
-import android.os.Looper
 import android.provider.Settings
-import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.sanepo.offgrid.BuildConfig
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -314,6 +309,13 @@ object AppUpdateManager {
             .getString(KEY_LAST_REMOTE_TAG, null)
     }
 
+    fun isValidApkHeaderAndSize(firstBytes: ByteArray, magicBytesRead: Int, totalBytes: Long): Boolean {
+        return magicBytesRead >= 2 &&
+            firstBytes[0] == 0x50.toByte() &&
+            firstBytes[1] == 0x4B.toByte() &&
+            totalBytes >= 100_000L
+    }
+
     fun downloadApkForInstall(
         context: Context,
         release: ReleaseInfo,
@@ -326,29 +328,100 @@ object AppUpdateManager {
         }
         val appCtx = context.applicationContext
         val updatesDir = File(appCtx.cacheDir, "updates").apply { mkdirs() }
-        updatesDir.listFiles()?.forEach { old -> if (old.name.endsWith(".apk")) old.delete() }
+        updatesDir.listFiles()?.forEach { old -> if (old.name.endsWith(".apk") || old.name.endsWith(".part")) old.delete() }
         val fileName = (release.apkAssetName ?: "SanepoOffGridLink-${release.tagName}.apk")
             .replace(Regex("[^A-Za-z0-9._\\-]"), "_")
+        val partFile = File(updatesDir, "$fileName.part")
         val destFile = File(updatesDir, fileName)
 
-        try {
-            val dm = appCtx.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
-            if (dm != null) {
-                val request = DownloadManager.Request(Uri.parse(url))
-                    .setTitle("Sanepo OffGrid Link ${release.tagName}")
-                    .setDescription("Mengunduh pembaruan APK resmi")
-                    .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
-                    .setDestinationUri(Uri.fromFile(destFile))
-                    .setAllowedOverMetered(true)
-                    .setAllowedOverRoaming(true)
+        Thread({
+            var conn: HttpURLConnection? = null
+            try {
+                conn = openHttpConnectionWithRedirects(url, maxRedirects = 6)
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    onState(DownloadState.Failed("Server unduhan mengembalikan HTTP $code."))
+                    return@Thread
+                }
 
-                val downloadId = dm.enqueue(request)
-                monitorDownloadManager(appCtx, dm, downloadId, destFile, release.expectedSha256, onState)
-                return
+                val expectedTotalBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    conn.contentLengthLong.takeIf { it > 0L } ?: release.apkSizeBytes
+                } else {
+                    conn.contentLength.toLong().takeIf { it > 0L } ?: release.apkSizeBytes
+                }
+
+                val digest = MessageDigest.getInstance("SHA-256")
+                val magic = ByteArray(4)
+                var magicRead = 0
+                var totalRead = 0L
+                val buf = ByteArray(16 * 1024)
+                var lastReportedPct = -1
+
+                conn.inputStream.use { input ->
+                    FileOutputStream(partFile).use { output ->
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            if (n == 0) continue
+                            if (magicRead < 4) {
+                                val copyLen = minOf(4 - magicRead, n)
+                                System.arraycopy(buf, 0, magic, magicRead, copyLen)
+                                magicRead += copyLen
+                            }
+                            output.write(buf, 0, n)
+                            digest.update(buf, 0, n)
+                            totalRead += n
+                            val pct = if (expectedTotalBytes > 0L) {
+                                ((totalRead * 100L) / expectedTotalBytes).toInt().coerceIn(0, 100)
+                            } else {
+                                0
+                            }
+                            if (pct != lastReportedPct) {
+                                lastReportedPct = pct
+                                onState(DownloadState.Progress(pct, totalRead, expectedTotalBytes))
+                            }
+                        }
+                        output.flush()
+                    }
+                }
+
+                if (!isValidApkHeaderAndSize(magic, magicRead, totalRead)) {
+                    partFile.delete()
+                    onState(DownloadState.Failed("File unduhan bukan paket APK yang valid."))
+                    return@Thread
+                }
+
+                val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
+                val expectedSha = release.expectedSha256
+                val shaVerified: Boolean? = if (!expectedSha.isNullOrBlank()) {
+                    actualSha.equals(expectedSha, ignoreCase = true)
+                } else null
+
+                if (shaVerified == false) {
+                    partFile.delete()
+                    onState(DownloadState.Failed("Verifikasi SHA-256 tidak cocok! Unduhan ditolak demi keamanan."))
+                    return@Thread
+                }
+
+                if (destFile.exists()) destFile.delete()
+                if (!partFile.renameTo(destFile)) {
+                    partFile.copyTo(destFile, overwrite = true)
+                    partFile.delete()
+                }
+
+                val note = if (shaVerified == true) {
+                    "Unduhan selesai & SHA-256 terverifikasi. Membuka pemasang..."
+                } else {
+                    "Unduhan selesai. Membuka pemasang APK..."
+                }
+                onState(DownloadState.ReadyToInstall(destFile, shaVerified, note))
+            } catch (t: Throwable) {
+                partFile.delete()
+                onState(DownloadState.Failed("Gagal mengunduh pembaruan: ${t.message ?: t.javaClass.simpleName}"))
+            } finally {
+                conn?.disconnect()
             }
-        } catch (_: Throwable) {
-        }
-        onState(DownloadState.Failed("Layanan DownloadManager tidak tersedia di perangkat."))
+        }, "SanepoOtaDownload").start()
     }
 
     fun canRequestPackageInstalls(context: Context): Boolean {
@@ -380,115 +453,37 @@ object AppUpdateManager {
         }
     }
 
-    private fun monitorDownloadManager(
-        context: Context,
-        dm: DownloadManager,
-        downloadId: Long,
-        destFile: File,
-        expectedSha256: String?,
-        onState: (DownloadState) -> Unit
-    ) {
-        val handler = Handler(Looper.getMainLooper())
-        var finished = false
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(ctx: Context?, intent: Intent?) {
-                val doneId = intent?.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L) ?: -1L
-                if (doneId != downloadId || finished) return
-                finished = true
-                try {
-                    context.unregisterReceiver(this)
-                } catch (_: Throwable) {
-                }
-                verifyAndEmitDownloadedApk(dm, downloadId, destFile, expectedSha256, onState)
+    private fun openHttpConnectionWithRedirects(initialUrl: String, maxRedirects: Int): HttpURLConnection {
+        var currentUrl = initialUrl
+        var redirects = 0
+        while (true) {
+            val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 15_000
+                readTimeout = 30_000
+                instanceFollowRedirects = false
+                setRequestProperty("User-Agent", "SanepoOffGridLink/${BuildConfig.VERSION_NAME} (Android)")
+                setRequestProperty("Accept", "application/octet-stream, application/vnd.android.package-archive")
             }
-        }
-        ContextCompat.registerReceiver(
-            context,
-            receiver,
-            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
-            ContextCompat.RECEIVER_EXPORTED
-        )
-
-        val poll = object : Runnable {
-            override fun run() {
-                if (finished) return
-                try {
-                    dm.query(DownloadManager.Query().setFilterById(downloadId))?.use { c ->
-                        if (c.moveToFirst()) {
-                            val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-                            val soFar = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
-                            val total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
-                            val pct = if (total > 0) ((soFar * 100L) / total).toInt().coerceIn(0, 100) else 0
-                            onState(DownloadState.Progress(pct, soFar, total))
-                            if (status == DownloadManager.STATUS_SUCCESSFUL || status == DownloadManager.STATUS_FAILED) {
-                                finished = true
-                                try {
-                                    context.unregisterReceiver(receiver)
-                                } catch (_: Throwable) {
-                                }
-                                verifyAndEmitDownloadedApk(dm, downloadId, destFile, expectedSha256, onState)
-                                return
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {
+            conn.connect()
+            val code = conn.responseCode
+            if (code == HttpURLConnection.HTTP_MOVED_PERM ||
+                code == HttpURLConnection.HTTP_MOVED_TEMP ||
+                code == HttpURLConnection.HTTP_SEE_OTHER ||
+                code == 307 ||
+                code == 308
+            ) {
+                val loc = conn.getHeaderField("Location")
+                conn.disconnect()
+                if (loc.isNullOrBlank() || redirects >= maxRedirects) {
+                    throw IllegalStateException("Terlalu banyak pengalihan URL ($code)")
                 }
-                handler.postDelayed(this, 350L)
+                currentUrl = URL(URL(currentUrl), loc).toString()
+                redirects++
+                continue
             }
+            return conn
         }
-        handler.postDelayed(poll, 250L)
-    }
-
-    private fun verifyAndEmitDownloadedApk(
-        dm: DownloadManager,
-        downloadId: Long,
-        destFile: File,
-        expectedSha256: String?,
-        onState: (DownloadState) -> Unit
-    ) {
-        try {
-            dm.query(DownloadManager.Query().setFilterById(downloadId))?.use { c ->
-                if (!c.moveToFirst()) {
-                    onState(DownloadState.Failed("Unduhan APK dibatalkan."))
-                    return
-                }
-                val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-                if (status != DownloadManager.STATUS_SUCCESSFUL) {
-                    val reason = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
-                    onState(DownloadState.Failed("Unduhan gagal (kode $reason)."))
-                    return
-                }
-            }
-        } catch (_: Throwable) {
-        }
-        if (!destFile.exists() || destFile.length() < 10_000L) {
-            onState(DownloadState.Failed("File APK tidak lengkap."))
-            return
-        }
-        val shaVerified: Boolean? = if (!expectedSha256.isNullOrBlank()) {
-            computeSha256Hex(destFile).equals(expectedSha256, ignoreCase = true)
-        } else null
-
-        if (shaVerified == false) {
-            destFile.delete()
-            onState(DownloadState.Failed("Verifikasi SHA-256 tidak cocok! Unduhan dibatalkan demi keamanan."))
-            return
-        }
-        val note = if (shaVerified == true) "SHA-256 terverifikasi. Siap pasang." else "APK siap dipasang."
-        onState(DownloadState.ReadyToInstall(destFile, shaVerified, note))
-    }
-
-    private fun computeSha256Hex(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buf = ByteArray(16_384)
-            var n = input.read(buf)
-            while (n > 0) {
-                digest.update(buf, 0, n)
-                n = input.read(buf)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun saveSuccessfulCheckMeta(context: Context, checkedAtMs: Long, tagName: String) {

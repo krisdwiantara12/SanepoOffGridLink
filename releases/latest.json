@@ -1,12 +1,12 @@
 {
-  "tagName": "v1.0.1",
-  "releaseName": "Sanepo OffGrid Link v1.0.1",
-  "body": "v1.0.1: Koneksi otomatis Bluetooth LE GATT tanpa Wi-Fi sama sekali + kompresi suara ADPCM 4:1, Jitter Buffer & WifiLock agar suara Wi-Fi lancar tanpa putus-putus.",
-  "publishedAt": "2026-11-27T13:10:00Z",
+  "tagName": "v1.0.2",
+  "releaseName": "Sanepo OffGrid Link v1.0.2",
+  "body": "v1.0.2: Perbaikan unduhan update OTA langsung lewat HTTPS tanpa DownloadManager, validasi header APK & checksum SHA-256, serta progres MB langsung.",
+  "publishedAt": "2026-11-27T16:52:30Z",
   "htmlUrl": "https://github.com/krisdwiantara12/SanepoOffGridLink/releases",
   "isPreRelease": false,
-  "apkAssetName": "SanepoOffGridLink-v1.0.1.apk",
-  "apkDownloadUrl": "https://raw.githubusercontent.com/krisdwiantara12/SanepoOffGridLink/main/releases/SanepoOffGridLink-v1.0.1.apk",
-  "apkSizeBytes": 898093,
-  "expectedSha256": "d8de121ec8c4ff7a9fb78b088032565d855991c55cb1f967042bf6a47c4e0d17"
+  "apkAssetName": "SanepoOffGridLink-v1.0.2.apk",
+  "apkDownloadUrl": "https://raw.githubusercontent.com/krisdwiantara12/SanepoOffGridLink/main/releases/SanepoOffGridLink-v1.0.2.apk",
+  "apkSizeBytes": 897727,
+  "expectedSha256": "b28fe81b0f62f662a1004c20de806605227d4bb29667c610fb36a46713275513"
 }

@@ -140,14 +140,20 @@ class AboutActivity : AppCompatActivity() {
                 when (state) {
                     is AppUpdateManager.DownloadState.Progress -> {
                         progressUpdateCheck.progress = state.percent
-                        tvUpdateStatus.text = "Mengunduh pembaruan: ${state.percent}%"
+                        val mbDone = "%.2f".format(state.downloadedBytes / (1024f * 1024f))
+                        val mbTotal = if (state.totalBytes > 0L) " / %.2f MB".format(state.totalBytes / (1024f * 1024f)) else ""
+                        tvUpdateStatus.text = "Mengunduh pembaruan: ${state.percent}% ($mbDone$mbTotal)"
                     }
                     is AppUpdateManager.DownloadState.ReadyToInstall -> {
                         progressUpdateCheck.visibility = View.GONE
                         btnCheckUpdate.isEnabled = true
                         btnInstallUpdate.isEnabled = true
-                        tvUpdateStatus.text = state.message
-                        AppUpdateManager.launchApkInstaller(this, state.apkFile)
+                        val launched = AppUpdateManager.launchApkInstaller(this, state.apkFile)
+                        tvUpdateStatus.text = if (launched) {
+                            state.message
+                        } else {
+                            "APK berhasil diunduh & diverifikasi, namun installer sistem gagal dibuka."
+                        }
                     }
                     is AppUpdateManager.DownloadState.Failed -> {
                         progressUpdateCheck.visibility = View.GONE
