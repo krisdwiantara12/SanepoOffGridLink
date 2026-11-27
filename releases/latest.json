@@ -1,12 +1,12 @@
 {
-  "tagName": "v1.0.3",
-  "releaseName": "Sanepo OffGrid Link v1.0.3",
-  "body": "v1.0.3: Perbaikan penuh suara tidak masuk (AudioSource.MIC + preamp, fallback TCP noDelay saat UDP terblokir, fix sync/antrean BLE GATT MTU 517), tombol Tes Mic & Speaker 2 detik, indikator TX/RX paket, serta perampingan banner BT/Lokasi.",
-  "publishedAt": "2026-11-27T17:08:00Z",
+  "tagName": "v1.1.0",
+  "releaseName": "Sanepo OffGrid Link v1.1.0",
+  "body": "v1.1.0: Perombakan besar jangkauan & kestabilan: Estafet Mesh Multi-Hop Live hingga 4 lompatan (jembatan otomatis Wi-Fi Direct, Hotspot & Bluetooth LE 2M PHY), Chat Anti-Hilang dengan antrean Outbox, kirim ulang otomatis, bukti terima ACK, & Sinkronisasi Riwayat otomatis, Radar Kompas Taktis 360 derajat berlabel jarak & panduan arah belok, serta Pusat Sambungan yang disederhanakan lengkap tombol Tes Ping.",
+  "publishedAt": "2026-11-28T01:06:00Z",
   "htmlUrl": "https://github.com/krisdwiantara12/SanepoOffGridLink/releases",
   "isPreRelease": false,
-  "apkAssetName": "SanepoOffGridLink-v1.0.3.apk",
-  "apkDownloadUrl": "https://raw.githubusercontent.com/krisdwiantara12/SanepoOffGridLink/main/releases/SanepoOffGridLink-v1.0.3.apk",
-  "apkSizeBytes": 903392,
-  "expectedSha256": "268132e78023885203c5ba3f5525389d8eb86996ad2c500545675e1985a827fe"
+  "apkAssetName": "SanepoOffGridLink-v1.1.0.apk",
+  "apkDownloadUrl": "https://raw.githubusercontent.com/krisdwiantara12/SanepoOffGridLink/main/releases/SanepoOffGridLink-v1.1.0.apk",
+  "apkSizeBytes": 934391,
+  "expectedSha256": "1fc09dc16d6a3fa33c4973e521442a7082b2a076f3fe98051c500afc21bc2a98"
 }

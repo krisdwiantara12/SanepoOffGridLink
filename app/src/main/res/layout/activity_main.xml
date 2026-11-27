@@ -155,7 +155,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:background="@drawable/bg_keycap_btn"
-            android:minHeight="40dp"
+            android:minHeight="44dp"
             android:paddingStart="12dp"
             android:paddingEnd="12dp"
             android:text="Cek Radar"
@@ -193,7 +193,7 @@
             android:layout_height="wrap_content"
             android:layout_marginStart="8dp"
             android:background="@drawable/bg_accent_btn"
-            android:minHeight="44dp"
+            android:minHeight="48dp"
             android:paddingStart="12dp"
             android:paddingEnd="12dp"
             android:text="Izinkan"
@@ -202,7 +202,7 @@
             android:textStyle="bold" />
     </LinearLayout>
 
-    <!-- Conditional Hardware Radio Toggle Banner (Bluetooth / Location OFF) -->
+    <!-- Conditional Hardware Radio Toggle Banner -->
     <LinearLayout
         android:id="@+id/bannerHardwareToggle"
         android:layout_width="match_parent"
@@ -221,7 +221,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Nyalakan Bluetooth &amp; Lokasi di kedua HP agar bisa langsung tersambung otomatis tanpa Wi-Fi."
+            android:text="Nyalakan Bluetooth &amp; Lokasi di kedua HP untuk koneksi otomatis, atau sambungkan ke Hotspot/Wi-Fi yang sama."
             android:textColor="@color/ink_primary"
             android:textSize="12sp" />
 
@@ -231,7 +231,7 @@
             android:layout_height="wrap_content"
             android:layout_marginStart="6dp"
             android:background="@drawable/bg_accent_btn"
-            android:minHeight="44dp"
+            android:minHeight="48dp"
             android:paddingStart="10dp"
             android:paddingEnd="10dp"
             android:text="Nyalakan BT"
@@ -245,7 +245,7 @@
             android:layout_height="wrap_content"
             android:layout_marginStart="6dp"
             android:background="@drawable/bg_keycap_btn"
-            android:minHeight="44dp"
+            android:minHeight="48dp"
             android:paddingStart="10dp"
             android:paddingEnd="10dp"
             android:text="Lokasi"
@@ -308,7 +308,7 @@
                             android:paddingTop="4dp"
                             android:paddingEnd="10dp"
                             android:paddingBottom="4dp"
-                            android:text="0 Unit Siaga"
+                            android:text="0 Siap Bicara"
                             android:textColor="@color/ink_primary"
                             android:textSize="12sp"
                             android:textStyle="bold" />
@@ -327,33 +327,82 @@
                         android:id="@+id/waveformMeter"
                         android:layout_width="match_parent"
                         android:layout_height="44dp"
-                        android:layout_marginTop="12dp" />
+                        android:layout_marginTop="10dp" />
 
                     <TextView
                         android:id="@+id/tvRadioTransportSummary"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_marginTop="8dp"
-                        android:fontFamily="monospace"
-                        android:text="BLE: Siap | P2P: Siaga | LAN: -"
-                        android:textColor="@color/ink_secondary"
-                        android:textSize="11sp" />
+                        android:layout_marginTop="10dp"
+                        android:background="@drawable/bg_status_chip"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:gravity="center_vertical"
+                        android:minHeight="40dp"
+                        android:paddingStart="10dp"
+                        android:paddingTop="6dp"
+                        android:paddingEnd="10dp"
+                        android:paddingBottom="6dp"
+                        android:text="Belum terhubung · Ketuk untuk buka menu Sambungan"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <!-- Alert when friend speaks on another channel -->
+                <LinearLayout
+                    android:id="@+id/bannerCrossChannel"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:background="@drawable/bg_well_live"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:paddingStart="12dp"
+                    android:paddingTop="8dp"
+                    android:paddingEnd="10dp"
+                    android:paddingBottom="8dp"
+                    android:visibility="gone">
+
+                    <TextView
+                        android:id="@+id/tvCrossChannelMsg"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Teman berbicara di CH-02"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <Button
+                        android:id="@+id/btnSwitchCrossChannel"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/bg_accent_btn"
+                        android:minHeight="48dp"
+                        android:paddingStart="12dp"
+                        android:paddingEnd="12dp"
+                        android:text="Pindah Saluran"
+                        android:textAllCaps="false"
+                        android:textColor="@color/ink_on_accent"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
                 </LinearLayout>
 
                 <!-- Hero Circular PTT Tactile Dome -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="0dp"
-                    android:layout_marginTop="18dp"
-                    android:layout_marginBottom="14dp"
+                    android:layout_marginTop="14dp"
+                    android:layout_marginBottom="12dp"
                     android:layout_weight="1"
                     android:gravity="center"
                     android:orientation="vertical">
 
                     <FrameLayout
                         android:id="@+id/btnPttDome"
-                        android:layout_width="196dp"
-                        android:layout_height="196dp"
+                        android:layout_width="192dp"
+                        android:layout_height="192dp"
                         android:background="@drawable/bg_ptt_dome"
                         android:clickable="true"
                         android:contentDescription="Tombol Push To Talk Walkie Talkie"
@@ -402,7 +451,7 @@
                     <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_marginTop="16dp"
+                        android:layout_marginTop="14dp"
                         android:gravity="center"
                         android:orientation="horizontal">
 
@@ -469,6 +518,7 @@
                         android:background="@drawable/bg_keycap_btn"
                         android:minHeight="48dp"
                         android:text="Tes Mic &amp; Speaker Lokal (2 Detik)"
+                        android:textAllCaps="false"
                         android:textColor="@color/ink_primary"
                         android:textSize="12sp"
                         android:textStyle="bold" />
@@ -523,68 +573,190 @@
             </LinearLayout>
         </ScrollView>
 
-        <!-- PANEL 2: COMPASS RADAR -->
-        <LinearLayout
+        <!-- PANEL 2: TACTICAL COMPASS RADAR -->
+        <ScrollView
             android:id="@+id/panelRadar"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:orientation="vertical"
-            android:padding="12dp"
+            android:fillViewport="true"
             android:visibility="gone">
 
-            <!-- Selected Target Numeric HUD -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:background="@drawable/bg_console_card"
                 android:orientation="vertical"
                 android:padding="12dp">
 
-                <TextView
-                    android:id="@+id/tvRadarTargetTitle"
+                <!-- Selected Target Guidance HUD -->
+                <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="Ketuk titik di radar atau daftar di bawah untuk kunci arah"
-                    android:textColor="@color/ink_primary"
-                    android:textSize="14sp"
-                    android:textStyle="bold" />
+                    android:background="@drawable/bg_console_card"
+                    android:orientation="vertical"
+                    android:padding="12dp">
+
+                    <TextView
+                        android:id="@+id/tvRadarTargetTitle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Ketuk titik teman di radar atau daftar di bawah"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvRadarTurnGuide"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="Arah hadap HP sedang dipindai..."
+                        android:textColor="@color/accent_ink"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvRadarLocalGps"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:fontFamily="monospace"
+                        android:text="Mencari satelit GNSS..."
+                        android:textColor="@color/ink_secondary"
+                        android:textSize="11sp" />
+
+                    <TextView
+                        android:id="@+id/tvRadarCalibrationWarn"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:background="@drawable/bg_status_chip"
+                        android:padding="6dp"
+                        android:text="Sensor kompas terganggu magnet: gerakkan HP membentuk angka 8"
+                        android:textColor="@color/status_warn"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:visibility="gone" />
+                </LinearLayout>
+
+                <!-- Scale Selector Row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal">
+
+                    <Button
+                        android:id="@+id/btnRadarRangeAuto"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginEnd="6dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_accent_btn"
+                        android:minHeight="48dp"
+                        android:text="Auto"
+                        android:textAllCaps="false"
+                        android:textColor="@color/ink_on_accent"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <Button
+                        android:id="@+id/btnRadarRange50"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginEnd="6dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_keycap_btn"
+                        android:minHeight="48dp"
+                        android:text="50 m"
+                        android:textAllCaps="false"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <Button
+                        android:id="@+id/btnRadarRange200"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginEnd="6dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_keycap_btn"
+                        android:minHeight="48dp"
+                        android:text="200 m"
+                        android:textAllCaps="false"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <Button
+                        android:id="@+id/btnRadarRange1k"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_keycap_btn"
+                        android:minHeight="48dp"
+                        android:text="1 km"
+                        android:textAllCaps="false"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <com.sanepo.offgrid.ui.CompassRadarView
+                    android:id="@+id/compassRadarView"
+                    android:layout_width="match_parent"
+                    android:layout_height="290dp"
+                    android:layout_marginTop="8dp" />
+
+                <!-- Honest Proximity Card for peers without GPS fix yet -->
+                <LinearLayout
+                    android:id="@+id/cardRadarNoGpsPeers"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:background="@drawable/bg_console_card"
+                    android:orientation="vertical"
+                    android:padding="10dp"
+                    android:visibility="gone">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Jarak Sinyal Sekitar (Teman Belum Kunci GPS)"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvRadarProximityList"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:fontFamily="monospace"
+                        android:text="-"
+                        android:textColor="@color/ink_secondary"
+                        android:textSize="12sp" />
+                </LinearLayout>
 
                 <TextView
-                    android:id="@+id/tvRadarLocalGps"
+                    android:id="@+id/tvRadarEmptyState"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:fontFamily="monospace"
-                    android:text="Mencari satelit GNSS..."
+                    android:layout_marginTop="10dp"
+                    android:background="@drawable/bg_console_card"
+                    android:gravity="center"
+                    android:padding="14dp"
+                    android:text="Belum ada unit terdeteksi. Pastikan teman aktif di sekitar atau gabung rombongan di tab Sambungan."
                     android:textColor="@color/ink_secondary"
-                    android:textSize="11sp" />
+                    android:textSize="13sp" />
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/rvRadarPeers"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:nestedScrollingEnabled="false" />
             </LinearLayout>
-
-            <com.sanepo.offgrid.ui.CompassRadarView
-                android:id="@+id/compassRadarView"
-                android:layout_width="match_parent"
-                android:layout_height="270dp"
-                android:layout_marginTop="10dp" />
-
-            <TextView
-                android:id="@+id/tvRadarEmptyState"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:background="@drawable/bg_console_card"
-                android:gravity="center"
-                android:padding="14dp"
-                android:text="Belum ada unit terdeteksi. Pastikan Bluetooth atau Wi-Fi Direct aktif di kedua perangkat."
-                android:textColor="@color/ink_secondary"
-                android:textSize="13sp" />
-
-            <androidx.recyclerview.widget.RecyclerView
-                android:id="@+id/rvRadarPeers"
-                android:layout_width="match_parent"
-                android:layout_height="0dp"
-                android:layout_marginTop="8dp"
-                android:layout_weight="1" />
-        </LinearLayout>
+        </ScrollView>
 
         <!-- PANEL 3: OFFLINE CHAT & FIELD PRESETS -->
         <LinearLayout
@@ -630,7 +802,7 @@
                         android:layout_height="wrap_content"
                         android:layout_marginTop="10dp"
                         android:gravity="center"
-                        android:text="Belum ada pesan di saluran ini. Gunakan tombol cepat di bawah atau ketik pesan baru."
+                        android:text="Belum ada pesan. Setiap pesan dijamin dikirim ulang otomatis dan tersinkron saat sinyal kembali."
                         android:textColor="@color/ink_secondary"
                         android:textSize="13sp" />
                 </LinearLayout>
@@ -706,7 +878,7 @@
             </LinearLayout>
         </LinearLayout>
 
-        <!-- PANEL 4: NETWORK, WI-FI DIRECT PAIRING & NODES -->
+        <!-- PANEL 4: CONNECTION HUB (SIMPLE, CLEAR, HUMAN-READABLE) -->
         <ScrollView
             android:id="@+id/panelNodes"
             android:layout_width="match_parent"
@@ -720,36 +892,76 @@
                 android:orientation="vertical"
                 android:padding="14dp">
 
-                <!-- Hardware & Local Radio Status -->
+                <!-- 1. Hero Connection Readiness Card -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
+                    android:background="@drawable/bg_hero_console"
+                    android:orientation="vertical"
+                    android:padding="14dp">
+
+                    <TextView
+                        android:id="@+id/tvNetworkHeroStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Belum Terhubung ke Teman"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="17sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvNetworkHeroSub"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="Bluetooth Siap · GPS Mencari"
+                        android:textColor="@color/ink_secondary"
+                        android:textSize="12sp" />
+
+                    <Button
+                        android:id="@+id/btnNetworkRescanAll"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:background="@drawable/bg_keycap_btn"
+                        android:minHeight="48dp"
+                        android:text="Segarkan &amp; Pindai Semua Jalur"
+                        android:textAllCaps="false"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <!-- 2. Mode 1: Wi-Fi Direct Long-Range Group -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
                     android:background="@drawable/bg_console_card"
                     android:orientation="vertical"
                     android:padding="14dp">
 
                     <TextView
-                        android:layout_width="wrap_content"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:text="Status Jaringan Lokal &amp; P2P"
+                        android:text="Cara 1: Jarak Jauh Tanpa Router (Wi-Fi Direct)"
                         android:textColor="@color/ink_primary"
-                        android:textSize="15sp"
+                        android:textSize="14sp"
                         android:textStyle="bold" />
 
                     <TextView
-                        android:id="@+id/tvNodeDiagnostics"
+                        android:id="@+id/tvP2pSimpleGuide"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_marginTop="6dp"
-                        android:fontFamily="monospace"
-                        android:text="Memuat status..."
+                        android:layout_marginTop="4dp"
+                        android:text="HP Ketua tekan Buat Rombongan. HP teman tekan Cari &amp; Gabung lalu ketuk nama grup. Semua HP otomatis saling estafet sinyal hingga 4 lompatan."
                         android:textColor="@color/ink_secondary"
                         android:textSize="12sp" />
 
                     <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_marginTop="12dp"
+                        android:layout_marginTop="10dp"
                         android:orientation="horizontal">
 
                         <Button
@@ -760,7 +972,8 @@
                             android:layout_weight="1"
                             android:background="@drawable/bg_accent_btn"
                             android:minHeight="48dp"
-                            android:text="Buat Host P2P"
+                            android:text="Buat Rombongan"
+                            android:textAllCaps="false"
                             android:textColor="@color/ink_on_accent"
                             android:textSize="12sp"
                             android:textStyle="bold" />
@@ -772,7 +985,8 @@
                             android:layout_weight="1"
                             android:background="@drawable/bg_keycap_btn"
                             android:minHeight="48dp"
-                            android:text="Pindai P2P"
+                            android:text="Cari &amp; Gabung"
+                            android:textAllCaps="false"
                             android:textColor="@color/ink_primary"
                             android:textSize="12sp"
                             android:textStyle="bold" />
@@ -785,54 +999,99 @@
                         android:layout_marginTop="8dp"
                         android:background="@drawable/bg_keycap_btn"
                         android:minHeight="48dp"
-                        android:text="Putuskan Grup Wi-Fi Direct"
-                        android:textColor="@color/ink_primary"
+                        android:text="Keluar dari Rombongan"
+                        android:textAllCaps="false"
+                        android:textColor="@color/sos_ink"
                         android:textSize="12sp"
+                        android:textStyle="bold"
                         android:visibility="gone" />
+
+                    <TextView
+                        android:id="@+id/tvP2pSimpleStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:text="Status: Siap mencari rombongan"
+                        android:textColor="@color/accent_ink"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tvP2pEmpty"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:background="@drawable/bg_status_chip"
+                        android:padding="10dp"
+                        android:text="Belum ada rombongan terlihat. Tekan Cari &amp; Gabung setelah ketua membuat rombongan."
+                        android:textColor="@color/ink_secondary"
+                        android:textSize="12sp" />
+
+                    <androidx.recyclerview.widget.RecyclerView
+                        android:id="@+id/rvP2pDiscovered"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:nestedScrollingEnabled="false" />
                 </LinearLayout>
 
-                <TextView
+                <!-- 3. Mode 2: Offline Phone Hotspot (Zero Quota, Multi-Device Ultra Clear) -->
+                <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:background="@drawable/bg_well_live"
-                    android:padding="12dp"
-                    android:text="Pilihan Koneksi Tanpa Kuota:\n1. Mode Bluetooth (Tanpa Wi-Fi): Wajib nyalakan Bluetooth + Lokasi HP di kedua HP (aturan Android OS untuk scan sekitar).\n2. Mode Hotspot Offline (Tanpa Bluetooth/Lokasi): Nyalakan Hotspot dari 1 HP tanpa kuota/SIM lalu HP lain gabung Wi-Fi ke Hotspot itu -> chat &amp; suara langsung lancar."
-                    android:textColor="@color/ink_primary"
-                    android:textSize="12sp" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="14dp"
-                    android:text="Perangkat Wi-Fi Direct Terlihat"
-                    android:textColor="@color/ink_primary"
-                    android:textSize="14sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/tvP2pEmpty"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
+                    android:layout_marginTop="12dp"
                     android:background="@drawable/bg_console_card"
-                    android:padding="12dp"
-                    android:text="Belum ada perangkat Wi-Fi Direct terdeteksi. Tekan Pindai P2P untuk mencari."
-                    android:textColor="@color/ink_secondary"
-                    android:textSize="12sp" />
+                    android:orientation="vertical"
+                    android:padding="14dp">
 
-                <androidx.recyclerview.widget.RecyclerView
-                    android:id="@+id/rvP2pDiscovered"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:nestedScrollingEnabled="false" />
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Cara 2: Pakai Hotspot HP Tanpa Kuota (Paling Stabil)"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
 
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="Nyalakan Hotspot dari 1 HP (tanpa SIM atau kuota tetap jalan). HP teman sambungkan Wi-Fi ke Hotspot itu, aplikasi otomatis tersambung walau 4G aktif."
+                        android:textColor="@color/ink_secondary"
+                        android:textSize="12sp" />
+
+                    <TextView
+                        android:id="@+id/tvHotspotStatusPill"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:background="@drawable/bg_status_chip"
+                        android:padding="8dp"
+                        android:text="Hotspot / Wi-Fi Lokal belum aktif"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <Button
+                        android:id="@+id/btnOpenWifiHotspotSettings"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:background="@drawable/bg_keycap_btn"
+                        android:minHeight="48dp"
+                        android:text="Buka Pengaturan Wi-Fi / Hotspot HP"
+                        android:textAllCaps="false"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <!-- 4. Connected Friends & Ping Test -->
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="14dp"
-                    android:text="Semua Unit di Jaringan Mesh (BLE + P2P + LAN)"
+                    android:text="Teman di Jaringan (Ketuk untuk Radar / Tes Ping)"
                     android:textColor="@color/ink_primary"
                     android:textSize="14sp"
                     android:textStyle="bold" />
@@ -844,7 +1103,7 @@
                     android:layout_marginTop="6dp"
                     android:background="@drawable/bg_console_card"
                     android:padding="12dp"
-                    android:text="Belum ada node aktif terdeteksi di sekitar."
+                    android:text="Belum ada teman terhubung di Bluetooth maupun Wi-Fi."
                     android:textColor="@color/ink_secondary"
                     android:textSize="12sp" />
 
@@ -854,6 +1113,32 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="6dp"
                     android:nestedScrollingEnabled="false" />
+
+                <!-- 5. Collapsible Technical Details (Optional for advanced check) -->
+                <Button
+                    android:id="@+id/btnToggleTechInfo"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:background="@drawable/bg_keycap_btn"
+                    android:minHeight="48dp"
+                    android:text="Tampilkan Detail Teknis Radio"
+                    android:textAllCaps="false"
+                    android:textColor="@color/ink_secondary"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/tvNodeDiagnostics"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:background="@drawable/bg_console_card"
+                    android:fontFamily="monospace"
+                    android:padding="12dp"
+                    android:text="Memuat status..."
+                    android:textColor="@color/ink_secondary"
+                    android:textSize="11sp"
+                    android:visibility="gone" />
             </LinearLayout>
         </ScrollView>
     </FrameLayout>
@@ -863,7 +1148,7 @@
         android:layout_height="1dp"
         android:background="@color/stroke_subtle" />
 
-    <!-- Bottom Thumb Navigation Dock (Fixed outside content frame, never hides items) -->
+    <!-- Bottom Thumb Navigation Dock -->
     <LinearLayout
         android:id="@+id/bottomNavBar"
         android:layout_width="match_parent"

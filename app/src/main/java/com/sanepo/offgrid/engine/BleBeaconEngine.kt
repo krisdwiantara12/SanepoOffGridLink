@@ -37,7 +37,10 @@ class BleBeaconEngine(
     private var running = false
     private var scanningActive = false
     private var advertisingActive = false
-    private var lowLatencyScan = true
+
+    private var voiceBusy = false
+    private var burstScanUntilMs = 0L
+    private var lastAppliedScanMode = -1
     private var lastAdvertiseRefreshMs = 0L
     private var pendingRefreshPosted = false
 
@@ -49,7 +52,7 @@ class BleBeaconEngine(
                     BluetoothAdapter.STATE_ON -> {
                         onBluetoothPowerChanged?.invoke(true)
                         if (running) {
-                            startScanInternal()
+                            triggerFastDiscoveryBurst(6_000L)
                             restartAdvertiseInternal()
                         }
                     }
@@ -57,7 +60,8 @@ class BleBeaconEngine(
                         onBluetoothPowerChanged?.invoke(false)
                         scanningActive = false
                         advertisingActive = false
-                        updateRepoState("Bluetooth mati: aktifkan untuk Radar BLE dan Beacon SOS")
+                        lastAppliedScanMode = -1
+                        updateRepoState("Bluetooth mati: aktifkan untuk mode Bluetooth & Radar")
                     }
                 }
             }
@@ -75,6 +79,7 @@ class BleBeaconEngine(
 
         override fun onScanFailed(errorCode: Int) {
             scanningActive = false
+            lastAppliedScanMode = -1
             updateRepoState("Pindai BLE terkendala (kode $errorCode)")
         }
     }
@@ -93,6 +98,18 @@ class BleBeaconEngine(
         }
     }
 
+    private val scanReevalRunnable = Runnable {
+        if (running && btAdapter?.isEnabled == true) {
+            reapplyScanModeIfNeeded()
+        }
+    }
+
+    private val voiceSafetyResetRunnable = Runnable {
+        if (voiceBusy) {
+            setVoiceActive(false)
+        }
+    }
+
     fun start() {
         val supported = context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE) && btAdapter != null
         MeshRepository.updateSnapshot(forceImmediate = false) {
@@ -108,15 +125,16 @@ class BleBeaconEngine(
         running = true
         registerStateReceiver()
         if (btAdapter?.isEnabled != true) {
-            updateRepoState("Bluetooth mati: aktifkan untuk Radar BLE dan Beacon SOS")
+            updateRepoState("Bluetooth mati: aktifkan untuk mode Bluetooth & Radar")
             return
         }
-        startScanInternal()
+        triggerFastDiscoveryBurst(6_000L)
         restartAdvertiseInternal()
     }
 
     fun stop() {
         running = false
+        voiceBusy = false
         mainHandler.removeCallbacksAndMessages(null)
         pendingRefreshPosted = false
         stopScanInternal()
@@ -127,12 +145,31 @@ class BleBeaconEngine(
         }
     }
 
-    fun setLowLatencyScan(aggressive: Boolean) {
-        if (lowLatencyScan == aggressive) return
-        lowLatencyScan = aggressive
+    /** Temporarily steps down or pauses BLE scan while live PTT audio flows so 2.4 GHz radio avoids RX starvation. */
+    fun setVoiceActive(active: Boolean) {
+        if (voiceBusy == active) return
+        voiceBusy = active
+        mainHandler.removeCallbacks(voiceSafetyResetRunnable)
+        if (active) {
+            mainHandler.postDelayed(voiceSafetyResetRunnable, 20_000L)
+        }
         if (running && btAdapter?.isEnabled == true) {
-            stopScanInternal()
-            startScanInternal()
+            reapplyScanModeIfNeeded()
+        }
+    }
+
+    fun triggerFastDiscoveryBurst(durationMs: Long = 6_000L) {
+        burstScanUntilMs = System.currentTimeMillis() + durationMs
+        mainHandler.removeCallbacks(scanReevalRunnable)
+        mainHandler.postDelayed(scanReevalRunnable, durationMs + 100L)
+        if (running && btAdapter?.isEnabled == true) {
+            reapplyScanModeIfNeeded()
+        }
+    }
+
+    fun onPeerLinkStateChanged() {
+        if (running && btAdapter?.isEnabled == true) {
+            reapplyScanModeIfNeeded()
         }
     }
 
@@ -151,8 +188,33 @@ class BleBeaconEngine(
         }
     }
 
+    private fun reapplyScanModeIfNeeded() {
+        val snap = MeshRepository.getSnapshot()
+        val hasDirectLink = snap.bleGattConnectedCount > 0 || snap.connectedTcpSockets > 0
+
+        // When live PTT audio runs AND at least one peer is already connected, pause BLE scan to dedicate radio airtime
+        if (voiceBusy && hasDirectLink) {
+            if (scanningActive) {
+                stopScanInternal()
+                lastAppliedScanMode = -1
+                updateRepoState("Prioritas penuh suara live PTT")
+            }
+            return
+        }
+
+        val desiredMode = when {
+            voiceBusy -> ScanSettings.SCAN_MODE_LOW_POWER
+            System.currentTimeMillis() < burstScanUntilMs && !hasDirectLink -> ScanSettings.SCAN_MODE_LOW_LATENCY
+            else -> ScanSettings.SCAN_MODE_BALANCED
+        }
+
+        if (!scanningActive || desiredMode != lastAppliedScanMode) {
+            startScanInternal(desiredMode)
+        }
+    }
+
     @SuppressLint("MissingPermission")
-    private fun startScanInternal() {
+    private fun startScanInternal(mode: Int) {
         if (!PermissionHelper.hasBleScanPermission(context)) {
             scanningActive = false
             updateRepoState("Butuh izin Bluetooth/Lokasi untuk memindai BLE")
@@ -167,11 +229,6 @@ class BleBeaconEngine(
             updateRepoState("Scanner BLE belum tersedia di perangkat ini")
             return
         }
-        val mode = if (lowLatencyScan) {
-            ScanSettings.SCAN_MODE_LOW_LATENCY
-        } else {
-            ScanSettings.SCAN_MODE_BALANCED
-        }
         val settings = ScanSettings.Builder()
             .setScanMode(mode)
             .build()
@@ -182,11 +239,13 @@ class BleBeaconEngine(
         try {
             activeScanner.startScan(emptyList(), settings, scanCallback)
             scanningActive = true
+            lastAppliedScanMode = mode
             updateRepoState(
                 if (advertisingActive) "Beacon & Radar BLE aktif" else "Radar BLE memindai"
             )
         } catch (t: Throwable) {
             scanningActive = false
+            lastAppliedScanMode = -1
             updateRepoState("Gagal memulai pindai BLE: ${t.message ?: "izin ditolak"}")
         }
     }
@@ -194,6 +253,7 @@ class BleBeaconEngine(
     @SuppressLint("MissingPermission")
     private fun stopScanInternal() {
         scanningActive = false
+        lastAppliedScanMode = -1
         if (!PermissionHelper.hasBleScanPermission(context)) return
         try {
             scanner?.stopScan(scanCallback)

@@ -1,5 +1,6 @@
 package com.sanepo.offgrid.engine
 
+import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -21,13 +22,16 @@ object OffGridProtocol {
     const val BLE_PAYLOAD_BYTES = 21
 
     const val AUDIO_MAGIC_0: Byte = 0x53 // 'S'
-    const val AUDIO_MAGIC_1: Byte = 0x4E // 'N'
+    const val AUDIO_MAGIC_1: Byte = 0x4E // 'N' (v1 12B header)
+    const val AUDIO_MAGIC_V2_1: Byte = 0x4F // 'O' (v2 13B header with TTL)
     const val AUDIO_TYPE_PCM: Byte = 0x01
     const val AUDIO_TYPE_ROGER: Byte = 0x02
     const val AUDIO_TYPE_ADPCM_16K: Byte = 0x03
     const val AUDIO_TYPE_ADPCM_8K: Byte = 0x04
     const val AUDIO_TYPE_PING: Byte = 0x05
     const val AUDIO_HEADER_BYTES = 12
+    const val AUDIO_HEADER_V2_BYTES = 13
+    const val DEFAULT_RELAY_TTL = 4
 
     const val GATT_MAGIC_0: Byte = 0xAB.toByte()
     const val GATT_MAGIC_1: Byte = 0x5A.toByte()
@@ -41,6 +45,9 @@ object OffGridProtocol {
     const val MSG_SOS = "SOS"
     const val MSG_PTT_FLOOR = "PTT_FLOOR"
     const val MSG_TCP_AUDIO = "AUD"
+    const val MSG_CHAT_SYNC_REQ = "SYNC_REQ"
+    const val MSG_CHAT_SYNC_BATCH = "SYNC_BATCH"
+    const val MSG_PING = "PING"
 
     data class BleBeaconPacket(
         val nodeId: String,
@@ -57,7 +64,8 @@ object OffGridProtocol {
         val channelNumber: Int,
         val senderNodeId: String,
         val sequence: Int,
-        val pcmBytes: ByteArray
+        val pcmBytes: ByteArray,
+        val ttl: Int = DEFAULT_RELAY_TTL
     )
 
     sealed class ControlEnvelope {
@@ -71,7 +79,10 @@ object OffGridProtocol {
             val latitude: Double?,
             val longitude: Double?,
             val altitudeMeters: Double?,
-            val accuracyMeters: Float?
+            val accuracyMeters: Float?,
+            val ttl: Int = 3,
+            val hopCount: Int = 0,
+            val viaCallsign: String? = null
         ) : ControlEnvelope()
 
         data class Chat(
@@ -83,19 +94,26 @@ object OffGridProtocol {
             val timestampMs: Long,
             val isSos: Boolean,
             val latitude: Double?,
-            val longitude: Double?
+            val longitude: Double?,
+            val ttl: Int = DEFAULT_RELAY_TTL,
+            val hopCount: Int = 0
         ) : ControlEnvelope()
 
         data class ChatAck(
             val msgId: String,
-            val receiverId: String
+            val receiverId: String,
+            val ttl: Int = DEFAULT_RELAY_TTL,
+            val hopCount: Int = 0
         ) : ControlEnvelope()
 
         data class PttFloor(
             val senderId: String,
             val senderCallsign: String,
             val channelNumber: Int,
-            val speaking: Boolean
+            val speaking: Boolean,
+            val ttl: Int = DEFAULT_RELAY_TTL,
+            val hopCount: Int = 0,
+            val eventTsMs: Long = System.currentTimeMillis()
         ) : ControlEnvelope()
 
         data class SosSignal(
@@ -104,11 +122,33 @@ object OffGridProtocol {
             val active: Boolean,
             val latitude: Double?,
             val longitude: Double?,
-            val batteryPercent: Int
+            val batteryPercent: Int,
+            val ttl: Int = DEFAULT_RELAY_TTL,
+            val hopCount: Int = 0,
+            val eventTsMs: Long = System.currentTimeMillis()
         ) : ControlEnvelope()
 
         data class TcpAudio(
             val packetBytes: ByteArray
+        ) : ControlEnvelope()
+
+        data class ChatSyncReq(
+            val requesterId: String,
+            val knownMsgIds: List<String>
+        ) : ControlEnvelope()
+
+        data class ChatSyncBatch(
+            val items: List<Chat>
+        ) : ControlEnvelope()
+
+        data class Ping(
+            val pingId: String,
+            val senderId: String,
+            val targetId: String,
+            val sentAtMs: Long,
+            val isReply: Boolean,
+            val ttl: Int = DEFAULT_RELAY_TTL,
+            val hopCount: Int = 0
         ) : ControlEnvelope()
     }
 
@@ -211,9 +251,38 @@ object OffGridProtocol {
         return out.array()
     }
 
+    fun encodeRelayAudioFrame(
+        type: Byte,
+        channelNumber: Int,
+        senderNodeId: String,
+        sequence: Int,
+        ttl: Int,
+        pcmBytes: ByteArray
+    ): ByteArray {
+        val clampedTtl = ttl.coerceIn(0, 15)
+        val out = ByteBuffer.allocate(AUDIO_HEADER_V2_BYTES + pcmBytes.size).order(ByteOrder.BIG_ENDIAN)
+        out.put(AUDIO_MAGIC_0)
+        out.put(AUDIO_MAGIC_V2_1)
+        out.put(type)
+        out.put(clampChannel(channelNumber).toByte())
+        out.putInt(parseNodeIdInt(senderNodeId))
+        out.putInt(sequence)
+        out.put(clampedTtl.toByte())
+        out.put(pcmBytes)
+        return out.array()
+    }
+
     fun decodeAudioFrame(bytes: ByteArray, length: Int = bytes.size): AudioFramePacket? {
         if (length < AUDIO_HEADER_BYTES) return null
-        if (bytes[0] != AUDIO_MAGIC_0 || bytes[1] != AUDIO_MAGIC_1) return null
+        if (bytes[0] != AUDIO_MAGIC_0) return null
+        val isV2 = when (bytes[1]) {
+            AUDIO_MAGIC_1 -> false
+            AUDIO_MAGIC_V2_1 -> true
+            else -> return null
+        }
+        val headerSize = if (isV2) AUDIO_HEADER_V2_BYTES else AUDIO_HEADER_BYTES
+        if (length < headerSize) return null
+
         val buffer = ByteBuffer.wrap(bytes, 2, length - 2).order(ByteOrder.BIG_ENDIAN)
         val type = buffer.get()
         if (type != AUDIO_TYPE_PCM &&
@@ -225,7 +294,8 @@ object OffGridProtocol {
         val channel = clampChannel(buffer.get().toInt() and 0xFF)
         val senderId = formatNodeIdHex(buffer.int)
         val seq = buffer.int
-        val pcmLen = length - AUDIO_HEADER_BYTES
+        val ttl = if (isV2) (buffer.get().toInt() and 0xFF).coerceIn(0, 15) else DEFAULT_RELAY_TTL
+        val pcmLen = length - headerSize
         val pcm = ByteArray(pcmLen)
         if (pcmLen > 0) {
             buffer.get(pcm)
@@ -235,7 +305,8 @@ object OffGridProtocol {
             channelNumber = channel,
             senderNodeId = senderId,
             sequence = seq,
-            pcmBytes = pcm
+            pcmBytes = pcm,
+            ttl = ttl
         )
     }
 
@@ -250,6 +321,9 @@ object OffGridProtocol {
                 obj.put("port", envelope.tcpPort)
                 obj.put("bat", envelope.batteryPercent)
                 obj.put("sos", envelope.isSos)
+                obj.put("ttl", envelope.ttl)
+                obj.put("hop", envelope.hopCount)
+                if (!envelope.viaCallsign.isNullOrBlank()) obj.put("via", envelope.viaCallsign)
                 if (envelope.latitude != null && envelope.longitude != null) {
                     obj.put("lat", envelope.latitude)
                     obj.put("lon", envelope.longitude)
@@ -257,24 +331,13 @@ object OffGridProtocol {
                 if (envelope.altitudeMeters != null) obj.put("alt", envelope.altitudeMeters)
                 if (envelope.accuracyMeters != null) obj.put("acc", envelope.accuracyMeters.toDouble())
             }
-            is ControlEnvelope.Chat -> {
-                obj.put("t", MSG_CHAT)
-                obj.put("mid", envelope.msgId)
-                obj.put("id", envelope.senderId)
-                obj.put("cs", envelope.senderCallsign)
-                obj.put("ch", envelope.channelNumber)
-                obj.put("txt", envelope.text)
-                obj.put("ts", envelope.timestampMs)
-                obj.put("sos", envelope.isSos)
-                if (envelope.latitude != null && envelope.longitude != null) {
-                    obj.put("lat", envelope.latitude)
-                    obj.put("lon", envelope.longitude)
-                }
-            }
+            is ControlEnvelope.Chat -> encodeChatObject(obj, envelope)
             is ControlEnvelope.ChatAck -> {
                 obj.put("t", MSG_CHAT_ACK)
                 obj.put("mid", envelope.msgId)
                 obj.put("id", envelope.receiverId)
+                obj.put("ttl", envelope.ttl)
+                obj.put("hop", envelope.hopCount)
             }
             is ControlEnvelope.PttFloor -> {
                 obj.put("t", MSG_PTT_FLOOR)
@@ -282,6 +345,9 @@ object OffGridProtocol {
                 obj.put("cs", envelope.senderCallsign)
                 obj.put("ch", envelope.channelNumber)
                 obj.put("spk", envelope.speaking)
+                obj.put("ttl", envelope.ttl)
+                obj.put("hop", envelope.hopCount)
+                obj.put("ts", envelope.eventTsMs)
             }
             is ControlEnvelope.SosSignal -> {
                 obj.put("t", MSG_SOS)
@@ -289,6 +355,9 @@ object OffGridProtocol {
                 obj.put("cs", envelope.senderCallsign)
                 obj.put("act", envelope.active)
                 obj.put("bat", envelope.batteryPercent)
+                obj.put("ttl", envelope.ttl)
+                obj.put("hop", envelope.hopCount)
+                obj.put("ts", envelope.eventTsMs)
                 if (envelope.latitude != null && envelope.longitude != null) {
                     obj.put("lat", envelope.latitude)
                     obj.put("lon", envelope.longitude)
@@ -298,8 +367,54 @@ object OffGridProtocol {
                 obj.put("t", MSG_TCP_AUDIO)
                 obj.put("d", toHexString(envelope.packetBytes))
             }
+            is ControlEnvelope.ChatSyncReq -> {
+                obj.put("t", MSG_CHAT_SYNC_REQ)
+                obj.put("id", envelope.requesterId)
+                val arr = JSONArray()
+                for (mid in envelope.knownMsgIds.take(80)) {
+                    arr.put(mid)
+                }
+                obj.put("ids", arr)
+            }
+            is ControlEnvelope.ChatSyncBatch -> {
+                obj.put("t", MSG_CHAT_SYNC_BATCH)
+                val arr = JSONArray()
+                for (item in envelope.items) {
+                    val itemObj = JSONObject()
+                    encodeChatObject(itemObj, item)
+                    arr.put(itemObj)
+                }
+                obj.put("items", arr)
+            }
+            is ControlEnvelope.Ping -> {
+                obj.put("t", MSG_PING)
+                obj.put("pid", envelope.pingId)
+                obj.put("id", envelope.senderId)
+                obj.put("to", envelope.targetId)
+                obj.put("ts", envelope.sentAtMs)
+                obj.put("rep", envelope.isReply)
+                obj.put("ttl", envelope.ttl)
+                obj.put("hop", envelope.hopCount)
+            }
         }
         return obj.toString()
+    }
+
+    private fun encodeChatObject(obj: JSONObject, chat: ControlEnvelope.Chat) {
+        obj.put("t", MSG_CHAT)
+        obj.put("mid", chat.msgId)
+        obj.put("id", chat.senderId)
+        obj.put("cs", chat.senderCallsign)
+        obj.put("ch", chat.channelNumber)
+        obj.put("txt", chat.text)
+        obj.put("ts", chat.timestampMs)
+        obj.put("sos", chat.isSos)
+        obj.put("ttl", chat.ttl)
+        obj.put("hop", chat.hopCount)
+        if (chat.latitude != null && chat.longitude != null) {
+            obj.put("lat", chat.latitude)
+            obj.put("lon", chat.longitude)
+        }
     }
 
     fun toHexString(bytes: ByteArray): String {
@@ -339,6 +454,7 @@ object OffGridProtocol {
                     val lon = if (obj.has("lon")) obj.optDouble("lon") else null
                     val alt = if (obj.has("alt")) obj.optDouble("alt") else null
                     val acc = if (obj.has("acc")) obj.optDouble("acc").toFloat() else null
+                    val via = obj.optString("via").trim().takeIf { it.isNotEmpty() }
                     ControlEnvelope.Hello(
                         nodeId = id,
                         callsign = sanitizeCallsign(obj.optString("cs", id)),
@@ -349,33 +465,23 @@ object OffGridProtocol {
                         latitude = lat,
                         longitude = lon,
                         altitudeMeters = alt,
-                        accuracyMeters = acc
+                        accuracyMeters = acc,
+                        ttl = obj.optInt("ttl", 3).coerceIn(0, 8),
+                        hopCount = obj.optInt("hop", 0).coerceIn(0, 8),
+                        viaCallsign = via
                     )
                 }
-                MSG_CHAT -> {
-                    val mid = obj.optString("mid").trim()
-                    val id = obj.optString("id").trim()
-                    val txt = obj.optString("txt")
-                    if (mid.isEmpty() || id.isEmpty() || txt.isBlank()) return null
-                    val lat = if (obj.has("lat")) obj.optDouble("lat") else null
-                    val lon = if (obj.has("lon")) obj.optDouble("lon") else null
-                    ControlEnvelope.Chat(
-                        msgId = mid,
-                        senderId = id,
-                        senderCallsign = sanitizeCallsign(obj.optString("cs", id)),
-                        channelNumber = clampChannel(obj.optInt("ch", 1)),
-                        text = txt,
-                        timestampMs = obj.optLong("ts", System.currentTimeMillis()),
-                        isSos = obj.optBoolean("sos", false),
-                        latitude = lat,
-                        longitude = lon
-                    )
-                }
+                MSG_CHAT -> decodeChatObject(obj)
                 MSG_CHAT_ACK -> {
                     val mid = obj.optString("mid").trim()
                     val id = obj.optString("id").trim()
                     if (mid.isEmpty() || id.isEmpty()) return null
-                    ControlEnvelope.ChatAck(msgId = mid, receiverId = id)
+                    ControlEnvelope.ChatAck(
+                        msgId = mid,
+                        receiverId = id,
+                        ttl = obj.optInt("ttl", DEFAULT_RELAY_TTL).coerceIn(0, 8),
+                        hopCount = obj.optInt("hop", 0).coerceIn(0, 8)
+                    )
                 }
                 MSG_PTT_FLOOR -> {
                     val id = obj.optString("id").trim()
@@ -384,7 +490,10 @@ object OffGridProtocol {
                         senderId = id,
                         senderCallsign = sanitizeCallsign(obj.optString("cs", id)),
                         channelNumber = clampChannel(obj.optInt("ch", 1)),
-                        speaking = obj.optBoolean("spk", false)
+                        speaking = obj.optBoolean("spk", false),
+                        ttl = obj.optInt("ttl", DEFAULT_RELAY_TTL).coerceIn(0, 8),
+                        hopCount = obj.optInt("hop", 0).coerceIn(0, 8),
+                        eventTsMs = obj.optLong("ts", System.currentTimeMillis())
                     )
                 }
                 MSG_SOS -> {
@@ -398,18 +507,80 @@ object OffGridProtocol {
                         active = obj.optBoolean("act", false),
                         latitude = lat,
                         longitude = lon,
-                        batteryPercent = obj.optInt("bat", -1)
+                        batteryPercent = obj.optInt("bat", -1),
+                        ttl = obj.optInt("ttl", DEFAULT_RELAY_TTL).coerceIn(0, 8),
+                        hopCount = obj.optInt("hop", 0).coerceIn(0, 8),
+                        eventTsMs = obj.optLong("ts", System.currentTimeMillis())
                     )
                 }
                 MSG_TCP_AUDIO -> {
                     val bytes = fromHexString(obj.optString("d")) ?: return null
                     ControlEnvelope.TcpAudio(bytes)
                 }
+                MSG_CHAT_SYNC_REQ -> {
+                    val id = obj.optString("id").trim()
+                    if (id.isEmpty()) return null
+                    val idsArr = obj.optJSONArray("ids")
+                    val ids = ArrayList<String>(idsArr?.length() ?: 0)
+                    if (idsArr != null) {
+                        for (i in 0 until idsArr.length()) {
+                            val mid = idsArr.optString(i).trim()
+                            if (mid.isNotEmpty()) ids.add(mid)
+                        }
+                    }
+                    ControlEnvelope.ChatSyncReq(requesterId = id, knownMsgIds = ids)
+                }
+                MSG_CHAT_SYNC_BATCH -> {
+                    val itemsArr = obj.optJSONArray("items") ?: return null
+                    val items = ArrayList<ControlEnvelope.Chat>(itemsArr.length())
+                    for (i in 0 until itemsArr.length()) {
+                        val itemObj = itemsArr.optJSONObject(i) ?: continue
+                        decodeChatObject(itemObj)?.let { items.add(it) }
+                    }
+                    ControlEnvelope.ChatSyncBatch(items = items)
+                }
+                MSG_PING -> {
+                    val pid = obj.optString("pid").trim()
+                    val sender = obj.optString("id").trim()
+                    val target = obj.optString("to").trim()
+                    if (pid.isEmpty() || sender.isEmpty() || target.isEmpty()) return null
+                    ControlEnvelope.Ping(
+                        pingId = pid,
+                        senderId = sender,
+                        targetId = target,
+                        sentAtMs = obj.optLong("ts", 0L),
+                        isReply = obj.optBoolean("rep", false),
+                        ttl = obj.optInt("ttl", DEFAULT_RELAY_TTL).coerceIn(0, 8),
+                        hopCount = obj.optInt("hop", 0).coerceIn(0, 8)
+                    )
+                }
                 else -> null
             }
         } catch (_: Throwable) {
             null
         }
+    }
+
+    private fun decodeChatObject(obj: JSONObject): ControlEnvelope.Chat? {
+        val mid = obj.optString("mid").trim()
+        val id = obj.optString("id").trim()
+        val txt = obj.optString("txt")
+        if (mid.isEmpty() || id.isEmpty() || txt.isBlank()) return null
+        val lat = if (obj.has("lat")) obj.optDouble("lat") else null
+        val lon = if (obj.has("lon")) obj.optDouble("lon") else null
+        return ControlEnvelope.Chat(
+            msgId = mid,
+            senderId = id,
+            senderCallsign = sanitizeCallsign(obj.optString("cs", id)),
+            channelNumber = clampChannel(obj.optInt("ch", 1)),
+            text = txt,
+            timestampMs = obj.optLong("ts", System.currentTimeMillis()),
+            isSos = obj.optBoolean("sos", false),
+            latitude = lat,
+            longitude = lon,
+            ttl = obj.optInt("ttl", DEFAULT_RELAY_TTL).coerceIn(0, 8),
+            hopCount = obj.optInt("hop", 0).coerceIn(0, 8)
+        )
     }
 }
 
@@ -449,6 +620,12 @@ object GeoMath {
     fun normalizeAzimuth(deg: Double): Double {
         val mod = deg % 360.0
         return if (mod < 0.0) mod + 360.0 else mod
+    }
+
+    /** Signed shortest turn angle in [-180, +180]: positive = turn right, negative = turn left. */
+    fun signedRelativeTurnDegrees(targetBearingDeg: Double, headingDeg: Double): Double {
+        val diff = ((targetBearingDeg - headingDeg) % 360.0 + 540.0) % 360.0 - 180.0
+        return diff
     }
 
     fun cardinalDirectionId(bearingDeg: Double): String {
@@ -642,8 +819,8 @@ class GattFrameAccumulator {
         val combined = ByteArray(buffer.size + chunk.size)
         System.arraycopy(buffer, 0, combined, 0, buffer.size)
         System.arraycopy(chunk, 0, combined, buffer.size, chunk.size)
-        buffer = if (combined.size > 8192) {
-            combined.copyOfRange(combined.size - 4096, combined.size)
+        buffer = if (combined.size > 16_384) {
+            combined.copyOfRange(combined.size - 8192, combined.size)
         } else {
             combined
         }
@@ -664,7 +841,7 @@ class GattFrameAccumulator {
             }
             val len = ((buffer[offset + 3].toInt() and 0xFF) shl 8) or
                 (buffer[offset + 4].toInt() and 0xFF)
-            if (len <= 0 || len > 4096) {
+            if (len <= 0 || len > 8192) {
                 offset += 2
                 continue
             }

@@ -17,14 +17,17 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import com.sanepo.offgrid.model.TransportLinkType
 import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 class BleGattTransport(
     private val context: Context,
-    private val onControlJsonReceived: (json: String, senderNodeIdHint: String?) -> Unit,
-    private val onAudioFrameReceived: (OffGridProtocol.AudioFramePacket) -> Unit
+    private val onControlJsonReceived: (json: String, senderNodeIdHint: String?, sourcePeerKey: String) -> Unit,
+    private val onAudioFrameReceived: (frame: OffGridProtocol.AudioFramePacket, sourcePeerKey: String) -> Unit,
+    private val onPeerLinkReady: (peerNodeId: String?, sourcePeerKey: String) -> Unit = { _, _ -> },
+    private val onPeerLinkLost: (peerNodeId: String?) -> Unit = {}
 ) {
     companion object {
         val UUID_SERVICE: UUID = UUID.fromString("00005A4E-0000-1000-8000-00805F9B34FB")
@@ -32,13 +35,19 @@ class BleGattTransport(
         val UUID_CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
     }
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-    private val btAdapter: BluetoothAdapter? = btManager?.adapter
+    private enum class ClientStage {
+        CONNECTING,
+        MTU_WAIT,
+        DISCOVERING,
+        CCCD_WRITING,
+        READY
+    }
 
-    private var running = false
-    private var gattServer: BluetoothGattServer? = null
-    private var serverChar: BluetoothGattCharacteristic? = null
+    private data class QueuedFrame(
+        val chunks: ArrayDeque<ByteArray>,
+        val noResponse: Boolean,
+        val isAudio: Boolean
+    )
 
     private data class OutboundClientSession(
         val nodeId: String,
@@ -46,11 +55,15 @@ class BleGattTransport(
         var gatt: BluetoothGatt? = null,
         var dataChar: BluetoothGattCharacteristic? = null,
         var mtuPayload: Int = 20,
+        var stage: ClientStage = ClientStage.CONNECTING,
+        var cccdRetries: Int = 0,
         var ready: Boolean = false,
-        var servicesRequested: Boolean = false,
         var inFlight: Boolean = false,
+        var chunkRetries: Int = 0,
         var writeToken: Long = 0L,
-        val queue: ArrayDeque<Pair<ByteArray, Boolean>> = ArrayDeque(),
+        val controlFrames: ArrayDeque<QueuedFrame> = ArrayDeque(),
+        val audioFrames: ArrayDeque<QueuedFrame> = ArrayDeque(),
+        var activeFrame: QueuedFrame? = null,
         val accumulator: GattFrameAccumulator = GattFrameAccumulator()
     )
 
@@ -60,10 +73,21 @@ class BleGattTransport(
         var mtuPayload: Int = 20,
         var subscribed: Boolean = false,
         var inFlight: Boolean = false,
+        var chunkRetries: Int = 0,
         var writeToken: Long = 0L,
-        val queue: ArrayDeque<ByteArray> = ArrayDeque(),
+        val controlFrames: ArrayDeque<QueuedFrame> = ArrayDeque(),
+        val audioFrames: ArrayDeque<QueuedFrame> = ArrayDeque(),
+        var activeFrame: QueuedFrame? = null,
         val accumulator: GattFrameAccumulator = GattFrameAccumulator()
     )
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+    private val btAdapter: BluetoothAdapter? = btManager?.adapter
+
+    private var running = false
+    private var gattServer: BluetoothGattServer? = null
+    private var serverChar: BluetoothGattCharacteristic? = null
 
     private val clientSessions = ConcurrentHashMap<String, OutboundClientSession>()
     private val serverPeers = ConcurrentHashMap<String, InboundServerPeer>()
@@ -107,6 +131,7 @@ class BleGattTransport(
             gattServer = null
             serverChar = null
         }
+        MeshRepository.clearTransportTypeAcrossPeers(TransportLinkType.BLE_GATT)
         updateGattCount()
     }
 
@@ -141,12 +166,12 @@ class BleGattTransport(
 
         val now = System.currentTimeMillis()
         val lastTry = lastAttemptByNode[packet.nodeId] ?: 0L
-        val minWait = if (localId > packet.nodeId) 5_000L else 7_000L
+        val minWait = if (localId > packet.nodeId) 5_500L else 8_000L
         if (now - lastTry < minWait) return
 
-        // Wait 3.5s on initial lower-ID sighting so higher ID connects once cleanly, then fall back
+        // Stagger initial connection slightly so higher node ID initiates cleanly first
         if (lastTry == 0L && localId < packet.nodeId) {
-            lastAttemptByNode[packet.nodeId] = now - (minWait - 3_500L)
+            lastAttemptByNode[packet.nodeId] = now - (minWait - 3_000L)
             return
         }
         lastAttemptByNode[packet.nodeId] = now
@@ -157,57 +182,109 @@ class BleGattTransport(
         return clientSessions.values.any { it.ready } || serverPeers.values.any { it.subscribed }
     }
 
-    fun sendControlJsonToAll(json: String, highPriority: Boolean = true) {
+    fun getConnectedNodeIds(): Set<String> {
+        val ids = HashSet<String>()
+        for (s in clientSessions.values) {
+            if (s.ready) ids.add(s.nodeId)
+        }
+        for (p in serverPeers.values) {
+            if (p.subscribed) {
+                val id = p.nodeId ?: macToNodeId[p.device.address]
+                if (id != null) ids.add(id)
+            }
+        }
+        return ids
+    }
+
+    fun sendControlJsonToAll(
+        json: String,
+        highPriority: Boolean = true,
+        excludePeerKey: String? = null
+    ) {
         if (!running || btAdapter?.isEnabled != true) return
         if (!PermissionHelper.hasBleConnectPermission(context)) return
         val framed = GattFrameAccumulator.wrapFrame(OffGridProtocol.GATT_TYPE_JSON, json.toByteArray(Charsets.UTF_8))
-        enqueueFrameToAllPeers(framed, urgentNoResponse = !highPriority, isAudio = false)
+        enqueueFrameToAllPeers(framed, urgentNoResponse = !highPriority, isAudio = false, excludePeerKey = excludePeerKey)
     }
 
-    fun sendAudioFrameToAll(audioPacket: ByteArray) {
+    fun sendAudioFrameToAll(audioPacket: ByteArray, excludePeerKey: String? = null) {
         if (!running || btAdapter?.isEnabled != true) return
         if (!PermissionHelper.hasBleConnectPermission(context)) return
         val framed = GattFrameAccumulator.wrapFrame(OffGridProtocol.GATT_TYPE_AUDIO, audioPacket)
-        enqueueFrameToAllPeers(framed, urgentNoResponse = true, isAudio = true)
+        enqueueFrameToAllPeers(framed, urgentNoResponse = true, isAudio = true, excludePeerKey = excludePeerKey)
     }
 
     private fun enqueueFrameToAllPeers(
         framedBytes: ByteArray,
         urgentNoResponse: Boolean,
-        isAudio: Boolean
+        isAudio: Boolean,
+        excludePeerKey: String?
     ) {
         val sentNodeIds = HashSet<String>()
         synchronized(lock) {
             for (session in clientSessions.values) {
                 if (!session.ready || session.gatt == null || session.dataChar == null) continue
+                val key = clientPeerKey(session.nodeId, session.deviceAddress)
+                if (excludePeerKey == key) continue
                 if (!sentNodeIds.add(session.nodeId)) continue
-                val step = maxOf(20, session.mtuPayload)
-                val neededChunks = (framedBytes.size + step - 1) / step
-                // Check whole-frame queue headroom before splitting so partial frames never corrupt GATT sync
-                if (isAudio && session.queue.size + neededChunks > 24) continue
-                var pos = 0
-                while (pos < framedBytes.size) {
-                    val end = minOf(framedBytes.size, pos + step)
-                    session.queue.addLast(framedBytes.copyOfRange(pos, end) to urgentNoResponse)
-                    pos = end
-                }
+                enqueueIntoQueues(
+                    framedBytes = framedBytes,
+                    noResponse = urgentNoResponse,
+                    isAudio = isAudio,
+                    mtuPayload = session.mtuPayload,
+                    controlFrames = session.controlFrames,
+                    audioFrames = session.audioFrames
+                )
                 drainClientQueue(session)
             }
             for (peer in serverPeers.values) {
                 if (!peer.subscribed) continue
                 val peerNodeId = peer.nodeId ?: macToNodeId[peer.device.address]
+                val key = serverPeerKey(peer.device.address)
+                if (excludePeerKey == key) continue
                 if (peerNodeId != null && !sentNodeIds.add(peerNodeId)) continue
-                val step = maxOf(20, peer.mtuPayload)
-                val neededChunks = (framedBytes.size + step - 1) / step
-                if (isAudio && peer.queue.size + neededChunks > 24) continue
-                var pos = 0
-                while (pos < framedBytes.size) {
-                    val end = minOf(framedBytes.size, pos + step)
-                    peer.queue.addLast(framedBytes.copyOfRange(pos, end))
-                    pos = end
-                }
+                enqueueIntoQueues(
+                    framedBytes = framedBytes,
+                    noResponse = true,
+                    isAudio = isAudio,
+                    mtuPayload = peer.mtuPayload,
+                    controlFrames = peer.controlFrames,
+                    audioFrames = peer.audioFrames
+                )
                 drainServerQueue(peer)
             }
+        }
+    }
+
+    private fun enqueueIntoQueues(
+        framedBytes: ByteArray,
+        noResponse: Boolean,
+        isAudio: Boolean,
+        mtuPayload: Int,
+        controlFrames: ArrayDeque<QueuedFrame>,
+        audioFrames: ArrayDeque<QueuedFrame>
+    ) {
+        val step = maxOf(20, mtuPayload)
+        val chunks = ArrayDeque<ByteArray>()
+        var pos = 0
+        while (pos < framedBytes.size) {
+            val end = minOf(framedBytes.size, pos + step)
+            chunks.addLast(framedBytes.copyOfRange(pos, end))
+            pos = end
+        }
+        val qFrame = QueuedFrame(chunks = chunks, noResponse = noResponse, isAudio = isAudio)
+        if (isAudio) {
+            // Keep max 10 buffered whole audio frames so latency stays real-time without fragmenting active frames
+            while (audioFrames.size >= 10) {
+                audioFrames.removeFirst()
+            }
+            audioFrames.addLast(qFrame)
+        } else {
+            // Cap extreme backlog at 48 control frames, never dropping Chat/Control silently under normal load
+            while (controlFrames.size >= 48) {
+                controlFrames.removeFirst()
+            }
+            controlFrames.addLast(qFrame)
         }
     }
 
@@ -256,36 +333,54 @@ class BleGattTransport(
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     session.gatt = gatt
+                    session.stage = ClientStage.MTU_WAIT
                     try {
                         gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                        val mtuStarted = gatt.requestMtu(517)
-                        if (!mtuStarted) {
-                            session.servicesRequested = true
-                            gatt.discoverServices()
-                        } else {
-                            // Some MediaTek/OEM BLE stacks drop onMtuChanged; ensure service discovery always starts
-                            mainHandler.postDelayed({
-                                if (!session.servicesRequested && running && session.gatt === gatt) {
-                                    session.servicesRequested = true
-                                    try {
-                                        gatt.discoverServices()
-                                    } catch (_: Throwable) {
-                                    }
-                                }
-                            }, 1500L)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            gatt.setPreferredPhy(
+                                BluetoothDevice.PHY_LE_2M_MASK,
+                                BluetoothDevice.PHY_LE_2M_MASK,
+                                BluetoothDevice.PHY_OPTION_NO_PREFERRED
+                            )
                         }
                     } catch (_: Throwable) {
                     }
+                    // Step 1: serialize MTU request slightly after link establishment
+                    mainHandler.postDelayed({
+                        if (!running || session.gatt !== gatt || session.stage != ClientStage.MTU_WAIT) return@postDelayed
+                        val mtuStarted = try {
+                            gatt.requestMtu(517)
+                        } catch (_: Throwable) {
+                            false
+                        }
+                        if (!mtuStarted) {
+                            beginServiceDiscovery(session, gatt)
+                        } else {
+                            // Safety fallback if OEM stack drops onMtuChanged
+                            mainHandler.postDelayed({
+                                if (running && session.gatt === gatt && session.stage == ClientStage.MTU_WAIT) {
+                                    beginServiceDiscovery(session, gatt)
+                                }
+                            }, 1350L)
+                        }
+                    }, 180L)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    val lostId = session.nodeId
                     synchronized(lock) {
                         session.ready = false
                         session.inFlight = false
-                        session.queue.clear()
+                        session.activeFrame = null
+                        session.controlFrames.clear()
+                        session.audioFrames.clear()
                         clientSessions.remove(nodeId)
                         try {
                             gatt.close()
                         } catch (_: Throwable) {
                         }
+                    }
+                    if (!hasAnyConnectionForNode(lostId)) {
+                        MeshRepository.clearPeerLinkType(lostId, TransportLinkType.BLE_GATT)
+                        onPeerLinkLost(lostId)
                     }
                     updateGattCount()
                 }
@@ -293,31 +388,32 @@ class BleGattTransport(
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                 session.mtuPayload = maxOf(20, mtu - 3)
-                if (!session.servicesRequested) {
-                    session.servicesRequested = true
-                    try {
-                        gatt.discoverServices()
-                    } catch (_: Throwable) {
-                    }
+                if (session.stage == ClientStage.MTU_WAIT) {
+                    beginServiceDiscovery(session, gatt)
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                if (status != BluetoothGatt.GATT_SUCCESS) return
+                if (status != BluetoothGatt.GATT_SUCCESS || session.stage != ClientStage.DISCOVERING) return
                 val svc = gatt.getService(UUID_SERVICE) ?: return
                 val ch = svc.getCharacteristic(UUID_CHAR_DATA) ?: return
                 session.dataChar = ch
-                gatt.setCharacteristicNotification(ch, true)
+                try {
+                    gatt.setCharacteristicNotification(ch, true)
+                } catch (_: Throwable) {
+                }
                 val cccd = ch.getDescriptor(UUID_CCCD)
                 if (cccd != null) {
-                    writeDescriptorCompat(gatt, cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                    session.stage = ClientStage.CCCD_WRITING
+                    session.cccdRetries = 0
+                    attemptWriteCccd(session, gatt, cccd)
                 } else {
                     markClientReadyAndGreet(session)
                 }
             }
 
             override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-                if (descriptor.uuid == UUID_CCCD) {
+                if (descriptor.uuid == UUID_CCCD && session.stage == ClientStage.CCCD_WRITING) {
                     markClientReadyAndGreet(session)
                 }
             }
@@ -325,6 +421,7 @@ class BleGattTransport(
             override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                 synchronized(lock) {
                     session.inFlight = false
+                    session.chunkRetries = 0
                     session.writeToken++
                     drainClientQueue(session)
                 }
@@ -335,7 +432,8 @@ class BleGattTransport(
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                     @Suppress("DEPRECATION")
                     val bytes = characteristic.value ?: return
-                    handleIncomingBytes(session.accumulator, bytes, session.nodeId, session.deviceAddress)
+                    val key = clientPeerKey(session.nodeId, session.deviceAddress)
+                    handleIncomingBytes(session.accumulator, bytes, session.nodeId, session.deviceAddress, key)
                 }
             }
 
@@ -344,7 +442,8 @@ class BleGattTransport(
                 characteristic: BluetoothGattCharacteristic,
                 value: ByteArray
             ) {
-                handleIncomingBytes(session.accumulator, value, session.nodeId, session.deviceAddress)
+                val key = clientPeerKey(session.nodeId, session.deviceAddress)
+                handleIncomingBytes(session.accumulator, value, session.nodeId, session.deviceAddress, key)
             }
         }
 
@@ -359,43 +458,80 @@ class BleGattTransport(
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private fun beginServiceDiscovery(session: OutboundClientSession, gatt: BluetoothGatt) {
+        if (!running || session.gatt !== gatt) return
+        session.stage = ClientStage.DISCOVERING
+        try {
+            gatt.discoverServices()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun attemptWriteCccd(
+        session: OutboundClientSession,
+        gatt: BluetoothGatt,
+        cccd: BluetoothGattDescriptor
+    ) {
+        if (!running || session.gatt !== gatt || session.stage != ClientStage.CCCD_WRITING) return
+        val ok = writeDescriptorCompat(gatt, cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+        if (ok) {
+            // Safety fallback if OEM fails to emit onDescriptorWrite despite returning true
+            mainHandler.postDelayed({
+                if (running && session.gatt === gatt && session.stage == ClientStage.CCCD_WRITING && !session.ready) {
+                    markClientReadyAndGreet(session)
+                }
+            }, 1400L)
+        } else if (session.cccdRetries < 5) {
+            session.cccdRetries++
+            mainHandler.postDelayed({
+                attemptWriteCccd(session, gatt, cccd)
+            }, 130L)
+        } else {
+            markClientReadyAndGreet(session)
+        }
+    }
+
     private fun markClientReadyAndGreet(session: OutboundClientSession) {
+        if (session.ready) return
+        session.stage = ClientStage.READY
         session.ready = true
         updateGattCount()
-        val snap = MeshRepository.getSnapshot()
-        val hello = OffGridProtocol.ControlEnvelope.Hello(
-            nodeId = snap.localNodeId,
-            callsign = snap.localCallsign,
-            channelNumber = snap.channelNumber,
-            tcpPort = OffGridProtocol.TCP_MESH_PORT,
-            batteryPercent = snap.batteryPercent,
-            isSos = snap.localSosActive,
-            latitude = snap.localLatitude,
-            longitude = snap.localLongitude,
-            altitudeMeters = snap.localAltitudeMeters,
-            accuracyMeters = snap.localGpsAccuracyMeters
-        )
+        val hello = buildHelloEnvelope()
         sendControlJsonToAll(OffGridProtocol.encodeControlJson(hello), highPriority = true)
+        onPeerLinkReady(session.nodeId, clientPeerKey(session.nodeId, session.deviceAddress))
     }
 
     @SuppressLint("MissingPermission")
     private fun drainClientQueue(session: OutboundClientSession) {
-        if (session.inFlight || session.queue.isEmpty()) return
+        if (session.inFlight) return
         val gatt = session.gatt ?: return
         val ch = session.dataChar ?: return
-        val (chunk, noResponse) = session.queue.removeFirst()
-        session.inFlight = true
-        val token = ++session.writeToken
-        val writeType = if (noResponse) {
+
+        val frame = selectNextFrame(session.activeFrame, session.controlFrames, session.audioFrames)
+            ?: return
+        session.activeFrame = frame
+        val chunk = frame.chunks.peekFirst()
+        if (chunk == null) {
+            session.activeFrame = null
+            drainClientQueue(session)
+            return
+        }
+
+        val writeType = if (frame.noResponse) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         } else {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
         val ok = writeCharacteristicCompat(gatt, ch, chunk, writeType)
-        if (!ok) {
-            session.inFlight = false
-            session.writeToken++
-        } else {
+        if (ok) {
+            frame.chunks.removeFirst()
+            if (frame.chunks.isEmpty()) {
+                session.activeFrame = null
+            }
+            session.inFlight = true
+            session.chunkRetries = 0
+            val token = ++session.writeToken
             mainHandler.postDelayed({
                 synchronized(lock) {
                     if (session.inFlight && session.writeToken == token) {
@@ -404,23 +540,56 @@ class BleGattTransport(
                         drainClientQueue(session)
                     }
                 }
-            }, 1200L)
+            }, 1000L)
+        } else {
+            // Radio stack temporarily busy: NEVER discard chunk on control/chat frames; retry cleanly
+            val maxRetries = if (frame.isAudio) 3 else 10
+            if (session.chunkRetries < maxRetries) {
+                session.chunkRetries++
+                mainHandler.postDelayed({
+                    synchronized(lock) {
+                        drainClientQueue(session)
+                    }
+                }, 45L)
+            } else {
+                // Only after repeated hardware failure on whole audio frame, drop remaining active audio frame
+                if (frame.isAudio) {
+                    session.activeFrame = null
+                } else {
+                    frame.chunks.removeFirst()
+                    if (frame.chunks.isEmpty()) session.activeFrame = null
+                }
+                session.chunkRetries = 0
+                drainClientQueue(session)
+            }
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun drainServerQueue(peer: InboundServerPeer) {
-        if (peer.inFlight || peer.queue.isEmpty()) return
+        if (peer.inFlight) return
         val server = gattServer ?: return
         val ch = serverChar ?: return
-        val chunk = peer.queue.removeFirst()
-        peer.inFlight = true
-        val token = ++peer.writeToken
+
+        val frame = selectNextFrame(peer.activeFrame, peer.controlFrames, peer.audioFrames)
+            ?: return
+        peer.activeFrame = frame
+        val chunk = frame.chunks.peekFirst()
+        if (chunk == null) {
+            peer.activeFrame = null
+            drainServerQueue(peer)
+            return
+        }
+
         val ok = notifyCharacteristicCompat(server, peer.device, ch, chunk)
-        if (!ok) {
-            peer.inFlight = false
-            peer.writeToken++
-        } else {
+        if (ok) {
+            frame.chunks.removeFirst()
+            if (frame.chunks.isEmpty()) {
+                peer.activeFrame = null
+            }
+            peer.inFlight = true
+            peer.chunkRetries = 0
+            val token = ++peer.writeToken
             mainHandler.postDelayed({
                 synchronized(lock) {
                     if (peer.inFlight && peer.writeToken == token) {
@@ -429,7 +598,41 @@ class BleGattTransport(
                         drainServerQueue(peer)
                     }
                 }
-            }, 1200L)
+            }, 1000L)
+        } else {
+            val maxRetries = if (frame.isAudio) 3 else 10
+            if (peer.chunkRetries < maxRetries) {
+                peer.chunkRetries++
+                mainHandler.postDelayed({
+                    synchronized(lock) {
+                        drainServerQueue(peer)
+                    }
+                }, 45L)
+            } else {
+                if (frame.isAudio) {
+                    peer.activeFrame = null
+                } else {
+                    frame.chunks.removeFirst()
+                    if (frame.chunks.isEmpty()) peer.activeFrame = null
+                }
+                peer.chunkRetries = 0
+                drainServerQueue(peer)
+            }
+        }
+    }
+
+    private fun selectNextFrame(
+        active: QueuedFrame?,
+        controlFrames: ArrayDeque<QueuedFrame>,
+        audioFrames: ArrayDeque<QueuedFrame>
+    ): QueuedFrame? {
+        if (active != null && active.chunks.isNotEmpty()) return active
+        return if (controlFrames.isNotEmpty()) {
+            controlFrames.removeFirst()
+        } else if (audioFrames.isNotEmpty()) {
+            audioFrames.removeFirst()
+        } else {
+            null
         }
     }
 
@@ -443,8 +646,14 @@ class BleGattTransport(
                     }
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                val removed: InboundServerPeer?
                 synchronized(lock) {
-                    serverPeers.remove(mac)
+                    removed = serverPeers.remove(mac)
+                }
+                val lostId = removed?.nodeId ?: macToNodeId[mac]
+                if (lostId != null && !hasAnyConnectionForNode(lostId)) {
+                    MeshRepository.clearPeerLinkType(lostId, TransportLinkType.BLE_GATT)
+                    onPeerLinkLost(lostId)
                 }
                 updateGattCount()
             }
@@ -469,27 +678,20 @@ class BleGattTransport(
             val peer = serverPeers[mac] ?: InboundServerPeer(device, nodeId = macToNodeId[mac]).also {
                 serverPeers[mac] = it
             }
+            var newlySubscribed = false
             if (descriptor.uuid == UUID_CCCD) {
                 val enabled = value != null && value.isNotEmpty() && (value[0].toInt() and 0x01) != 0
+                newlySubscribed = enabled && !peer.subscribed
                 peer.subscribed = enabled
                 updateGattCount()
                 if (enabled) {
                     mainHandler.postDelayed({
-                        val snap = MeshRepository.getSnapshot()
-                        val hello = OffGridProtocol.ControlEnvelope.Hello(
-                            nodeId = snap.localNodeId,
-                            callsign = snap.localCallsign,
-                            channelNumber = snap.channelNumber,
-                            tcpPort = OffGridProtocol.TCP_MESH_PORT,
-                            batteryPercent = snap.batteryPercent,
-                            isSos = snap.localSosActive,
-                            latitude = snap.localLatitude,
-                            longitude = snap.localLongitude,
-                            altitudeMeters = snap.localAltitudeMeters,
-                            accuracyMeters = snap.localGpsAccuracyMeters
-                        )
+                        val hello = buildHelloEnvelope()
                         sendControlJsonToAll(OffGridProtocol.encodeControlJson(hello), highPriority = true)
-                    }, 180L)
+                        if (newlySubscribed) {
+                            onPeerLinkReady(peer.nodeId ?: macToNodeId[mac], serverPeerKey(mac))
+                        }
+                    }, 160L)
                 }
             }
             if (responseNeeded) {
@@ -521,7 +723,7 @@ class BleGattTransport(
             val peer = serverPeers[mac] ?: InboundServerPeer(device, nodeId = macToNodeId[mac]).also {
                 serverPeers[mac] = it
             }
-            handleIncomingBytes(peer.accumulator, bytes, peer.nodeId, mac)
+            handleIncomingBytes(peer.accumulator, bytes, peer.nodeId, mac, serverPeerKey(mac))
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
@@ -529,6 +731,7 @@ class BleGattTransport(
             val peer = serverPeers[mac] ?: return
             synchronized(lock) {
                 peer.inFlight = false
+                peer.chunkRetries = 0
                 peer.writeToken++
                 drainServerQueue(peer)
             }
@@ -539,7 +742,8 @@ class BleGattTransport(
         accumulator: GattFrameAccumulator,
         chunk: ByteArray,
         nodeIdHint: String?,
-        sourceMac: String?
+        sourceMac: String?,
+        sourcePeerKey: String
     ) {
         val frames = synchronized(accumulator) { accumulator.feed(chunk) }
         for ((type, payload) in frames) {
@@ -547,25 +751,51 @@ class BleGattTransport(
                 OffGridProtocol.GATT_TYPE_JSON -> {
                     val json = String(payload, Charsets.UTF_8)
                     val decoded = OffGridProtocol.decodeControlJson(json)
-                    if (decoded is OffGridProtocol.ControlEnvelope.Hello && sourceMac != null) {
+                    if (decoded is OffGridProtocol.ControlEnvelope.Hello && decoded.hopCount == 0 && sourceMac != null) {
                         macToNodeId[sourceMac] = decoded.nodeId
                         serverPeers[sourceMac]?.nodeId = decoded.nodeId
                     }
-                    onControlJsonReceived(json, nodeIdHint)
+                    onControlJsonReceived(json, nodeIdHint, sourcePeerKey)
                 }
                 OffGridProtocol.GATT_TYPE_AUDIO -> {
                     val audio = OffGridProtocol.decodeAudioFrame(payload, payload.size)
                     if (audio != null) {
-                        if (sourceMac != null) {
+                        if (sourceMac != null && !macToNodeId.containsKey(sourceMac)) {
                             macToNodeId[sourceMac] = audio.senderNodeId
                             serverPeers[sourceMac]?.nodeId = audio.senderNodeId
                         }
-                        onAudioFrameReceived(audio)
+                        onAudioFrameReceived(audio, sourcePeerKey)
                     }
                 }
             }
         }
     }
+
+    private fun hasAnyConnectionForNode(nodeId: String): Boolean {
+        val clientOk = clientSessions[nodeId]?.ready == true
+        val serverOk = serverPeers.values.any { it.subscribed && (it.nodeId ?: macToNodeId[it.device.address]) == nodeId }
+        return clientOk || serverOk
+    }
+
+    private fun buildHelloEnvelope(): OffGridProtocol.ControlEnvelope.Hello {
+        val snap = MeshRepository.getSnapshot()
+        return OffGridProtocol.ControlEnvelope.Hello(
+            nodeId = snap.localNodeId,
+            callsign = snap.localCallsign,
+            channelNumber = snap.channelNumber,
+            tcpPort = OffGridProtocol.TCP_MESH_PORT,
+            batteryPercent = snap.batteryPercent,
+            isSos = snap.localSosActive,
+            latitude = snap.localLatitude,
+            longitude = snap.localLongitude,
+            altitudeMeters = snap.localAltitudeMeters,
+            accuracyMeters = snap.localGpsAccuracyMeters
+        )
+    }
+
+    private fun clientPeerKey(nodeId: String, mac: String): String = "BLE_C:$nodeId:$mac"
+
+    private fun serverPeerKey(mac: String): String = "BLE_S:$mac"
 
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
@@ -594,15 +824,16 @@ class BleGattTransport(
         gatt: BluetoothGatt,
         desc: BluetoothGattDescriptor,
         value: ByteArray
-    ) {
-        try {
+    ): Boolean {
+        return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(desc, value)
+                gatt.writeDescriptor(desc, value) == BluetoothStatusCodes.SUCCESS
             } else {
                 desc.value = value
                 gatt.writeDescriptor(desc)
             }
         } catch (_: Throwable) {
+            false
         }
     }
 

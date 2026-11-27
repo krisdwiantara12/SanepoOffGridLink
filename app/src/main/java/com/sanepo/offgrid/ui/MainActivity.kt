@@ -44,11 +44,15 @@ import com.sanepo.offgrid.engine.MeshRepository
 import com.sanepo.offgrid.engine.OffGridProtocol
 import com.sanepo.offgrid.engine.PermissionHelper
 import com.sanepo.offgrid.model.ChatMessage
+import com.sanepo.offgrid.model.CompassAccuracyState
 import com.sanepo.offgrid.model.MeshStatusSnapshot
 import com.sanepo.offgrid.model.PeerNode
+import com.sanepo.offgrid.model.RadarRangeMode
+import com.sanepo.offgrid.model.TransportLinkType
 import com.sanepo.offgrid.model.WifiDirectDiscoveredPeer
 import com.sanepo.offgrid.service.OffGridService
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity(), MeshRepository.Observer {
 
@@ -58,14 +62,21 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     private var currentTab = Tab.RADIO
     private var attachGpsToChat = false
     private var selectedRadarNodeId: String? = null
+    private var currentRangeMode = RadarRangeMode.AUTO
+    private var lastTargetAligned = false
     private var unreadChatCount = 0
     private var lastMessageCount = 0
+    private var lastRenderedMessages: List<ChatMessage> = emptyList()
     private var hardwarePttActive = false
+    private var showTechDiagnostics = false
 
     private var offGridService: OffGridService? = null
     private var serviceBound = false
 
-    private val chatAdapter = ChatMessageAdapter()
+    private val chatAdapter = ChatMessageAdapter { msg ->
+        offGridService?.retryChatMessage(msg.msgId)
+        Toast.makeText(this, "Mengirim ulang pesan...", Toast.LENGTH_SHORT).show()
+    }
     private lateinit var radarPeerAdapter: PeerNodeAdapter
     private lateinit var allPeerAdapter: PeerNodeAdapter
     private lateinit var p2pDiscoveredAdapter: WifiDirectPeerAdapter
@@ -93,6 +104,9 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     private lateinit var tvRadioPeerCountBadge: TextView
     private lateinit var tvRadioFloorState: TextView
     private lateinit var tvRadioTransportSummary: TextView
+    private lateinit var bannerCrossChannel: View
+    private lateinit var tvCrossChannelMsg: TextView
+    private lateinit var btnSwitchCrossChannel: Button
     private lateinit var waveformMeter: WaveformMeterView
     private lateinit var btnPttDome: View
     private lateinit var ivPttIcon: ImageView
@@ -105,8 +119,16 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     private lateinit var progressSosHold: android.widget.ProgressBar
 
     private lateinit var tvRadarTargetTitle: TextView
+    private lateinit var tvRadarTurnGuide: TextView
     private lateinit var tvRadarLocalGps: TextView
+    private lateinit var tvRadarCalibrationWarn: TextView
+    private lateinit var btnRadarRangeAuto: Button
+    private lateinit var btnRadarRange50: Button
+    private lateinit var btnRadarRange200: Button
+    private lateinit var btnRadarRange1k: Button
     private lateinit var compassRadarView: CompassRadarView
+    private lateinit var cardRadarNoGpsPeers: View
+    private lateinit var tvRadarProximityList: TextView
     private lateinit var tvRadarEmptyState: View
 
     private lateinit var rvChatMessages: androidx.recyclerview.widget.RecyclerView
@@ -115,6 +137,13 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     private lateinit var btnAttachGpsChat: View
     private lateinit var etChatInput: EditText
 
+    private lateinit var tvNetworkHeroStatus: TextView
+    private lateinit var tvNetworkHeroSub: TextView
+    private lateinit var btnNetworkRescanAll: Button
+    private lateinit var tvP2pSimpleStatus: TextView
+    private lateinit var tvHotspotStatusPill: TextView
+    private lateinit var btnOpenWifiHotspotSettings: Button
+    private lateinit var btnToggleTechInfo: Button
     private lateinit var tvNodeDiagnostics: TextView
     private lateinit var btnDisconnectP2p: Button
     private lateinit var tvP2pEmpty: View
@@ -176,6 +205,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         setupAdapters()
         setupInteractions()
         selectTab(Tab.RADIO)
+        selectRadarRange(RadarRangeMode.AUTO)
 
         OffGridService.start(this)
         requestMissingPermissionsIfNeeded(initialLaunch = true)
@@ -236,15 +266,28 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         wifiDirectPeers: List<WifiDirectDiscoveredPeer>,
         messages: List<ChatMessage>
     ) {
+        val readyPeers = peers.filter { it.hasTwoWayLink() }
+        val signalOnlyCount = peers.size - readyPeers.size
+        val sameChReady = readyPeers.count { it.channelNumber == snapshot.channelNumber }
+
         tvHeaderCallsign.text = "${snapshot.localCallsign} | CH-%02d".format(snapshot.channelNumber)
-        tvHeaderSummary.text = "${peers.size} unit terdeteksi | ${snapshot.wifiDirectRole}"
+        tvHeaderSummary.text = when {
+            readyPeers.isNotEmpty() && snapshot.relayedPeersCount > 0 ->
+                "${readyPeers.size} siap bicara (Estafet Mesh aktif)"
+            readyPeers.isNotEmpty() ->
+                "${readyPeers.size} teman siap bicara & chat"
+            signalOnlyCount > 0 ->
+                "$signalOnlyCount sinyal terdeteksi · Menyambungkan..."
+            else ->
+                "Belum terhubung · Ketuk Sambungan"
+        }
 
         // SOS alert banner
         val remoteSos = snapshot.remoteSosNodes
         when {
             snapshot.localSosActive -> {
                 bannerSosAlert.visibility = View.VISIBLE
-                tvSosBannerText.text = "DARURAT SOS LOKAL AKTIF (BLE & Wi-Fi memancar)"
+                tvSosBannerText.text = "DARURAT SOS LOKAL AKTIF (Semua jalur memancar)"
                 btnSosBannerAction.text = "Matikan"
                 btnSosBannerAction.setOnClickListener {
                     offGridService?.toggleLocalSos()
@@ -265,8 +308,11 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
 
         // Tab 1: Radio PTT
         tvRadioChannelBig.text = "SALURAN CH-%02d".format(snapshot.channelNumber)
-        val sameChannelCount = peers.count { it.channelNumber == snapshot.channelNumber }
-        tvRadioPeerCountBadge.text = "$sameChannelCount di CH-%02d (${peers.size} total)".format(snapshot.channelNumber)
+        tvRadioPeerCountBadge.text = if (readyPeers.isNotEmpty()) {
+            "$sameChReady/${readyPeers.size} Siap"
+        } else {
+            "0 Siap"
+        }
 
         val rxActive = (snapshot.activeTalkerCallsign != null || snapshot.isAudioSelfTestRunning) && !snapshot.isLocalTransmitting
         waveformMeter.updateAudioState(
@@ -288,15 +334,15 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         tvPttDomeLabel.setTextColor(pttTextColor)
         tvPttDomeLabel.text = when {
             snapshot.isPttLatched -> "MIC DIKUNCI (TX)"
-            snapshot.isLocalTransmitting -> "MENGIRIM SUARA..."
+            snapshot.isLocalTransmitting -> "MENGIRIM LIVE..."
             else -> "TAHAN BICARA"
         }
 
         val speakerMuted = offGridService?.isSpeakerMuted() == true
         tvRadioFloorState.text = when {
             snapshot.isAudioSelfTestRunning -> "TES MIC & SPEAKER: Silakan bicara dekat HP..."
-            snapshot.isLocalTransmitting -> "MEMANCAR [${snapshot.activeAudioTransport}] · Paket TX: ${snapshot.txAudioPackets}"
-            snapshot.activeTalkerCallsign != null -> "MENERIMA DARI ${snapshot.activeTalkerCallsign} · Paket RX: ${snapshot.rxAudioPackets}"
+            snapshot.isLocalTransmitting -> "BICARA LIVE [${snapshot.activeAudioTransport}] · Paket ${snapshot.txAudioPackets}"
+            snapshot.activeTalkerCallsign != null -> "MENERIMA DARI ${snapshot.activeTalkerCallsign} · Paket ${snapshot.rxAudioPackets}"
             speakerMuted -> "PERHATIAN: Volume Media HP 0%! Naikkan volume agar suara terdengar."
             snapshot.lastError != null -> snapshot.lastError
             else -> "SIAGA DENGAR : TX ${snapshot.txAudioPackets} | RX ${snapshot.rxAudioPackets} paket"
@@ -309,14 +355,21 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             "Tes Mic & Speaker Lokal (2 Detik)"
         }
 
-        val btLinkText = when {
-            snapshot.bleGattConnectedCount > 0 -> "BT+ (${snapshot.bleGattConnectedCount})"
-            snapshot.bleAdvertising || snapshot.bleScanning -> "BLE Aktif"
-            snapshot.bleEnabled -> "Siap"
-            else -> "Mati"
+        val transportReadable = buildReadableRadioLinkSummary(snapshot, readyPeers)
+        tvRadioTransportSummary.text = transportReadable
+
+        val crossCh = snapshot.crossChannelAlertNumber
+        if (crossCh != null && crossCh != snapshot.channelNumber && !snapshot.crossChannelAlertText.isNullOrBlank()) {
+            bannerCrossChannel.visibility = View.VISIBLE
+            tvCrossChannelMsg.text = snapshot.crossChannelAlertText
+            btnSwitchCrossChannel.text = "Pindah CH-%02d".format(crossCh)
+            btnSwitchCrossChannel.setOnClickListener {
+                offGridService?.updateIdentityAndBroadcast(snapshot.localCallsign, crossCh)
+            }
+        } else {
+            bannerCrossChannel.visibility = View.GONE
         }
-        val lanTag = snapshot.localLanIps.firstOrNull() ?: "-"
-        tvRadioTransportSummary.text = "$btLinkText | P2P: ${snapshot.wifiDirectRole} | TCP: ${snapshot.connectedTcpSockets} | IP: $lanTag"
+
         updateHardwareBanner(snapshot)
 
         tvLatchLabel.text = if (snapshot.isPttLatched) "Kunci Mic: AKTIF" else "Kunci Mic: MATI"
@@ -329,8 +382,13 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             "TAHAN 2 DETIK : PANCARKAN DARURAT SOS"
         }
 
-        // Tab 2: Radar Compass
+        // Tab 2: Tactical Compass Radar
         tvRadarLocalGps.text = snapshot.gpsStatusText
+        tvRadarCalibrationWarn.visibility = if (snapshot.compassAccuracy == CompassAccuracyState.LOW_NEEDS_CALIBRATION) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
         compassRadarView.updateRadarData(
             localLatitude = snapshot.localLatitude,
             localLongitude = snapshot.localLongitude,
@@ -340,62 +398,217 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         )
         radarPeerAdapter.submitList(peers, snapshot.localLatitude, snapshot.localLongitude)
         tvRadarEmptyState.visibility = if (peers.isEmpty()) View.VISIBLE else View.GONE
-        updateRadarTargetHud(snapshot, peers)
+        updateRadarTargetHudAndProximity(snapshot, peers)
 
-        // Tab 3: Chat
-        if (messages.size > lastMessageCount) {
-            val delta = messages.size - lastMessageCount
-            if (currentTab != Tab.CHAT && lastMessageCount > 0) {
-                unreadChatCount += delta
+        // Tab 3: Guaranteed Chat
+        if (messages != lastRenderedMessages) {
+            val prevCount = lastMessageCount
+            if (messages.size > prevCount && currentTab != Tab.CHAT && prevCount > 0) {
+                unreadChatCount += (messages.size - prevCount)
             }
             lastMessageCount = messages.size
-            chatAdapter.submitList(messages)
-            if (messages.isNotEmpty()) {
+            lastRenderedMessages = messages
+            chatAdapter.submitList(messages, peers)
+            if (messages.size > prevCount && messages.isNotEmpty()) {
                 rvChatMessages.scrollToPosition(messages.size - 1)
             }
-        } else if (messages.size != chatAdapter.itemCount) {
-            chatAdapter.submitList(messages)
         }
         chatEmptyState.visibility = if (messages.isEmpty()) View.VISIBLE else View.GONE
-        tvChatEmptyMsg.text = "Belum ada pesan di CH-%02d. Gunakan pesan cepat di bawah atau ketik pesan baru.".format(snapshot.channelNumber)
+        tvChatEmptyMsg.text = "Belum ada pesan di CH-%02d. Setiap pesan dikirim ulang otomatis dan tersinkron saat sinyal kembali.".format(snapshot.channelNumber)
         tabViews[Tab.CHAT]?.third?.text = if (unreadChatCount > 0) "Chat ($unreadChatCount)" else getString(R.string.tab_chat)
 
-        // Tab 4: Nodes & Network
-        val ipText = if (snapshot.localLanIps.isEmpty()) "Tidak ada Wi-Fi/Hotspot aktif" else snapshot.localLanIps.joinToString(", ")
-        tvNodeDiagnostics.text = buildString {
-            appendLine("Node ID: ${snapshot.localNodeId} (${snapshot.localCallsign})")
-            appendLine("BLE: ${snapshot.bleStatusDetail} | GATT Aktif: ${snapshot.bleGattConnectedCount}")
-            appendLine("Wi-Fi Direct: ${snapshot.wifiDirectRole} | ${snapshot.wifiDirectDetail}")
-            appendLine("IP Lokal: $ipText")
-            append("Socket TCP Terhubung: ${snapshot.connectedTcpSockets} | Baterai: ${snapshot.batteryPercent}%")
+        // Tab 4: Simple Connection Hub
+        updateConnectionHubUi(snapshot, peers, readyPeers, signalOnlyCount, wifiDirectPeers)
+    }
+
+    private fun buildReadableRadioLinkSummary(
+        snapshot: MeshStatusSnapshot,
+        readyPeers: List<PeerNode>
+    ): String {
+        val hasWifiPath = snapshot.connectedTcpSockets > 0 ||
+            snapshot.wifiDirectRole.startsWith("Ketua") ||
+            snapshot.wifiDirectRole.startsWith("Anggota") ||
+            snapshot.hotspotActive
+        val hasBtPath = snapshot.bleGattConnectedCount > 0
+        val parts = mutableListOf<String>()
+        if (hasWifiPath) {
+            if (snapshot.hotspotActive) parts.add("Hotspot/Wi-Fi") else parts.add("Wi-Fi Direct")
         }
-        val inGroup = snapshot.wifiDirectRole.startsWith("Host") || snapshot.wifiDirectRole.startsWith("Klien")
+        if (hasBtPath) parts.add("Bluetooth")
+        if (snapshot.relayedPeersCount > 0) parts.add("Estafet ${snapshot.relayedPeersCount} HP")
+
+        return when {
+            readyPeers.isNotEmpty() && parts.isNotEmpty() ->
+                "Jalur Aktif: ${parts.joinToString(" + ")} · ${readyPeers.size} teman siap"
+            parts.isNotEmpty() ->
+                "Jalur Siap (${parts.joinToString(" + ")}) · Menunggu teman"
+            else ->
+                "Belum tersambung · Ketuk untuk buka menu Sambungan"
+        }
+    }
+
+    private fun updateConnectionHubUi(
+        snapshot: MeshStatusSnapshot,
+        allPeers: List<PeerNode>,
+        readyPeers: List<PeerNode>,
+        signalOnlyCount: Int,
+        wifiDirectPeers: List<WifiDirectDiscoveredPeer>
+    ) {
+        when {
+            readyPeers.isNotEmpty() -> {
+                val relayNote = if (snapshot.relayedPeersCount > 0) " · Estafet Aktif" else ""
+                tvNetworkHeroStatus.text = "Tersambung Siap Bicara (${readyPeers.size} Teman)$relayNote"
+                tvNetworkHeroStatus.setTextColor(ContextCompat.getColor(this, R.color.status_live))
+            }
+            signalOnlyCount > 0 -> {
+                tvNetworkHeroStatus.text = "Mendeteksi $signalOnlyCount Sinyal · Menyambung Otomatis..."
+                tvNetworkHeroStatus.setTextColor(ContextCompat.getColor(this, R.color.status_warn))
+            }
+            else -> {
+                tvNetworkHeroStatus.text = "Belum Terhubung ke Teman"
+                tvNetworkHeroStatus.setTextColor(ContextCompat.getColor(this, R.color.ink_primary))
+            }
+        }
+
+        val btTxt = when {
+            snapshot.bleGattConnectedCount > 0 -> "Bluetooth Tersambung (${snapshot.bleGattConnectedCount})"
+            snapshot.bleEnabled -> "Bluetooth Siap"
+            else -> "Bluetooth Mati"
+        }
+        val wifiTxt = when {
+            snapshot.hotspotActive -> "Hotspot Aktif"
+            snapshot.wifiDirectRole.startsWith("Ketua") || snapshot.wifiDirectRole.startsWith("Anggota") -> snapshot.wifiDirectRole
+            snapshot.wifiEnabled -> "Wi-Fi Siap"
+            else -> "Wi-Fi Mati"
+        }
+        val gpsTxt = if (snapshot.localLatitude != null) "GPS Terkunci" else "GPS Mencari"
+        tvNetworkHeroSub.text = "$btTxt · $wifiTxt · $gpsTxt"
+
+        tvP2pSimpleStatus.text = "Status: ${snapshot.wifiDirectRole} · ${snapshot.wifiDirectDetail}"
+        val inGroup = snapshot.wifiDirectRole.startsWith("Ketua") || snapshot.wifiDirectRole.startsWith("Anggota")
         btnDisconnectP2p.visibility = if (inGroup) View.VISIBLE else View.GONE
+
+        val lanAvailable = snapshot.hotspotActive || snapshot.localLanIps.any { !it.startsWith("192.168.49.") }
+        if (lanAvailable) {
+            tvHotspotStatusPill.text = if (snapshot.hotspotActive) {
+                "Hotspot HP Aktif · Teman yang gabung Wi-Fi otomatis tersambung"
+            } else {
+                "Wi-Fi Lokal Tersambung · Otomatis siap chat & suara HD"
+            }
+            tvHotspotStatusPill.setBackgroundResource(R.drawable.bg_well_live)
+        } else {
+            tvHotspotStatusPill.text = "Hotspot / Wi-Fi Lokal belum tersambung"
+            tvHotspotStatusPill.setBackgroundResource(R.drawable.bg_status_chip)
+        }
 
         p2pDiscoveredAdapter.submitList(wifiDirectPeers)
         tvP2pEmpty.visibility = if (wifiDirectPeers.isEmpty()) View.VISIBLE else View.GONE
 
-        allPeerAdapter.submitList(peers, snapshot.localLatitude, snapshot.localLongitude)
-        tvMeshEmpty.visibility = if (peers.isEmpty()) View.VISIBLE else View.GONE
+        allPeerAdapter.submitList(allPeers, snapshot.localLatitude, snapshot.localLongitude)
+        tvMeshEmpty.visibility = if (allPeers.isEmpty()) View.VISIBLE else View.GONE
+
+        val ipText = if (snapshot.localLanIps.isEmpty()) "-" else snapshot.localLanIps.joinToString(", ")
+        tvNodeDiagnostics.text = buildString {
+            appendLine("Node ID: ${snapshot.localNodeId} (${snapshot.localCallsign})")
+            appendLine("BLE: ${snapshot.bleStatusDetail} | GATT Aktif: ${snapshot.bleGattConnectedCount}")
+            appendLine("Wi-Fi Direct: ${snapshot.wifiDirectRole} | TCP Aktif: ${snapshot.connectedTcpSockets}")
+            appendLine("IP Lokal: $ipText | Estafet Peer: ${snapshot.relayedPeersCount}")
+            append("Baterai: ${snapshot.batteryPercent}%")
+        }
     }
 
-    private fun updateRadarTargetHud(snapshot: MeshStatusSnapshot, peers: List<PeerNode>) {
-        val target = peers.firstOrNull { it.nodeId == selectedRadarNodeId } ?: peers.firstOrNull()
-        if (target == null) {
-            tvRadarTargetTitle.text = "Belum ada target di radar (${snapshot.deviceAzimuthDeg.toInt()}° arah hadap)"
-            return
-        }
+    private fun updateRadarTargetHudAndProximity(snapshot: MeshStatusSnapshot, peers: List<PeerNode>) {
+        val hdg = GeoMath.normalizeAzimuth(snapshot.deviceAzimuthDeg.toDouble()).toInt()
+        val hdgCard = GeoMath.cardinalDirectionId(hdg.toDouble())
         val lat = snapshot.localLatitude
         val lon = snapshot.localLongitude
+
+        // Honest non-GPS proximity summary
+        val nonGpsPeers = peers.filter { lat == null || lon == null || it.latitude == null || it.longitude == null }
+        if (nonGpsPeers.isEmpty()) {
+            cardRadarNoGpsPeers.visibility = View.GONE
+        } else {
+            cardRadarNoGpsPeers.visibility = View.VISIBLE
+            tvRadarProximityList.text = nonGpsPeers.joinToString("\n") { p ->
+                val sigLabel = when {
+                    p.estimatedBleMeters != null -> {
+                        val band = when {
+                            p.estimatedBleMeters <= 5.0 -> "Sangat Dekat"
+                            p.estimatedBleMeters <= 16.0 -> "Sedang"
+                            else -> "Agak Jauh"
+                        }
+                        "$band (~${GeoMath.formatDistanceCompact(p.estimatedBleMeters)})"
+                    }
+                    p.hopCount > 0 -> "Estafet ${p.hopCount}x (menunggu GPS)"
+                    else -> "Tersambung Wi-Fi (menunggu GPS)"
+                }
+                "• ${p.callsign} : $sigLabel"
+            }
+        }
+
+        val target = peers.firstOrNull { it.nodeId == selectedRadarNodeId }
+            ?: peers.firstOrNull { it.latitude != null && it.longitude != null }
+            ?: peers.firstOrNull()
+
+        if (target == null) {
+            lastTargetAligned = false
+            tvRadarTargetTitle.text = "Belum ada teman terdeteksi di radar"
+            tvRadarTurnGuide.text = "Arah hadap Anda: %03d° ($hdgCard)".format(hdg)
+            tvRadarTurnGuide.setTextColor(ContextCompat.getColor(this, R.color.ink_secondary))
+            return
+        }
+
+        val ageSec = ((System.currentTimeMillis() - target.lastSeenMs) / 1000L).coerceAtLeast(0L)
+        val freshLabel = if (ageSec < 5L) "Live" else "${ageSec} dtk lalu"
+        val linkNote = if (target.hopCount > 0) "Estafet ${target.hopCount}x" else "Langsung"
+
         if (lat != null && lon != null && target.latitude != null && target.longitude != null) {
             val meters = GeoMath.haversineDistanceMeters(lat, lon, target.latitude, target.longitude)
             val bearing = GeoMath.initialBearingDegrees(lat, lon, target.latitude, target.longitude)
             val card = GeoMath.cardinalDirectionId(bearing)
-            tvRadarTargetTitle.text = "TARGET: ${target.callsign} | ARAH: ${bearing.toInt()}° ($card) | JARAK: ${GeoMath.formatDistanceCompact(meters)}"
+            val turn = GeoMath.signedRelativeTurnDegrees(bearing, snapshot.deviceAzimuthDeg.toDouble())
+            val absTurn = abs(turn).toInt()
+
+            tvRadarTargetTitle.text = "TARGET: ${target.callsign} · $linkNote ($freshLabel)"
+            if (absTurn <= 10) {
+                tvRadarTurnGuide.text = "LURUS DI DEPAN · ${GeoMath.formatDistanceCompact(meters)} (${bearing.toInt()}° $card)"
+                tvRadarTurnGuide.setTextColor(ContextCompat.getColor(this, R.color.status_live))
+                if (!lastTargetAligned && currentTab == Tab.RADAR) {
+                    compassRadarView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                }
+                lastTargetAligned = true
+            } else {
+                lastTargetAligned = false
+                val dirWord = if (turn > 0) "BELOK KANAN" else "BELOK KIRI"
+                tvRadarTurnGuide.text = "$dirWord $absTurn° · ${GeoMath.formatDistanceCompact(meters)} (${bearing.toInt()}° $card)"
+                tvRadarTurnGuide.setTextColor(ContextCompat.getColor(this, R.color.accent_ink))
+            }
         } else if (target.estimatedBleMeters != null) {
-            tvRadarTargetTitle.text = "TARGET: ${target.callsign} | RSSI BLE ~${GeoMath.formatDistanceCompact(target.estimatedBleMeters)} (tanpa sudut GPS)"
+            lastTargetAligned = false
+            tvRadarTargetTitle.text = "TARGET: ${target.callsign} · $freshLabel"
+            tvRadarTurnGuide.text = "Jarak sinyal ~${GeoMath.formatDistanceCompact(target.estimatedBleMeters)} (tunggu GPS untuk arah kompas)"
+            tvRadarTurnGuide.setTextColor(ContextCompat.getColor(this, R.color.status_warn))
         } else {
-            tvRadarTargetTitle.text = "TARGET: ${target.callsign} | Terhubung via P2P/LAN (tanpa koordinat GPS)"
+            lastTargetAligned = false
+            tvRadarTargetTitle.text = "TARGET: ${target.callsign} · $linkNote"
+            tvRadarTurnGuide.text = "Menunggu GPS teman aktif · Arah Anda %03d° ($hdgCard)".format(hdg)
+            tvRadarTurnGuide.setTextColor(ContextCompat.getColor(this, R.color.ink_secondary))
+        }
+    }
+
+    private fun selectRadarRange(mode: RadarRangeMode) {
+        currentRangeMode = mode
+        compassRadarView.setRangeMode(mode)
+        val buttons = listOf(
+            RadarRangeMode.AUTO to btnRadarRangeAuto,
+            RadarRangeMode.M50 to btnRadarRange50,
+            RadarRangeMode.M200 to btnRadarRange200,
+            RadarRangeMode.KM1 to btnRadarRange1k
+        )
+        for ((m, btn) in buttons) {
+            val active = m == mode
+            btn.setBackgroundResource(if (active) R.drawable.bg_accent_btn else R.drawable.bg_keycap_btn)
+            btn.setTextColor(ContextCompat.getColor(this, if (active) R.color.ink_on_accent else R.color.ink_primary))
         }
     }
 
@@ -422,6 +635,9 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         tvRadioPeerCountBadge = findViewById(R.id.tvRadioPeerCountBadge)
         tvRadioFloorState = findViewById(R.id.tvRadioFloorState)
         tvRadioTransportSummary = findViewById(R.id.tvRadioTransportSummary)
+        bannerCrossChannel = findViewById(R.id.bannerCrossChannel)
+        tvCrossChannelMsg = findViewById(R.id.tvCrossChannelMsg)
+        btnSwitchCrossChannel = findViewById(R.id.btnSwitchCrossChannel)
         waveformMeter = findViewById(R.id.waveformMeter)
         btnPttDome = findViewById(R.id.btnPttDome)
         ivPttIcon = findViewById(R.id.ivPttIcon)
@@ -434,8 +650,16 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         progressSosHold = findViewById(R.id.progressSosHold)
 
         tvRadarTargetTitle = findViewById(R.id.tvRadarTargetTitle)
+        tvRadarTurnGuide = findViewById(R.id.tvRadarTurnGuide)
         tvRadarLocalGps = findViewById(R.id.tvRadarLocalGps)
+        tvRadarCalibrationWarn = findViewById(R.id.tvRadarCalibrationWarn)
+        btnRadarRangeAuto = findViewById(R.id.btnRadarRangeAuto)
+        btnRadarRange50 = findViewById(R.id.btnRadarRange50)
+        btnRadarRange200 = findViewById(R.id.btnRadarRange200)
+        btnRadarRange1k = findViewById(R.id.btnRadarRange1k)
         compassRadarView = findViewById(R.id.compassRadarView)
+        cardRadarNoGpsPeers = findViewById(R.id.cardRadarNoGpsPeers)
+        tvRadarProximityList = findViewById(R.id.tvRadarProximityList)
         tvRadarEmptyState = findViewById(R.id.tvRadarEmptyState)
 
         rvChatMessages = findViewById(R.id.rvChatMessages)
@@ -444,6 +668,13 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         btnAttachGpsChat = findViewById(R.id.btnAttachGpsChat)
         etChatInput = findViewById(R.id.etChatInput)
 
+        tvNetworkHeroStatus = findViewById(R.id.tvNetworkHeroStatus)
+        tvNetworkHeroSub = findViewById(R.id.tvNetworkHeroSub)
+        btnNetworkRescanAll = findViewById(R.id.btnNetworkRescanAll)
+        tvP2pSimpleStatus = findViewById(R.id.tvP2pSimpleStatus)
+        tvHotspotStatusPill = findViewById(R.id.tvHotspotStatusPill)
+        btnOpenWifiHotspotSettings = findViewById(R.id.btnOpenWifiHotspotSettings)
+        btnToggleTechInfo = findViewById(R.id.btnToggleTechInfo)
         tvNodeDiagnostics = findViewById(R.id.tvNodeDiagnostics)
         btnDisconnectP2p = findViewById(R.id.btnDisconnectP2p)
         tvP2pEmpty = findViewById(R.id.tvP2pEmpty)
@@ -470,17 +701,25 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         val onPeerPicked: (PeerNode) -> Unit = { peer ->
             selectedRadarNodeId = peer.nodeId
             selectTab(Tab.RADAR)
-            updateRadarTargetHud(MeshRepository.getSnapshot(), MeshRepository.getPeersSorted())
+            val snap = MeshRepository.getSnapshot()
+            val list = MeshRepository.getPeersSorted()
+            updateRadarTargetHudAndProximity(snap, list)
             compassRadarView.updateRadarData(
-                MeshRepository.getSnapshot().localLatitude,
-                MeshRepository.getSnapshot().localLongitude,
-                MeshRepository.getSnapshot().deviceAzimuthDeg,
-                MeshRepository.getPeersSorted(),
+                snap.localLatitude,
+                snap.localLongitude,
+                snap.deviceAzimuthDeg,
+                list,
                 selectedRadarNodeId
             )
         }
-        radarPeerAdapter = PeerNodeAdapter(onPeerPicked)
-        allPeerAdapter = PeerNodeAdapter(onPeerPicked)
+        radarPeerAdapter = PeerNodeAdapter(onSelectPeer = onPeerPicked, onPingPeer = null)
+        allPeerAdapter = PeerNodeAdapter(
+            onSelectPeer = onPeerPicked,
+            onPingPeer = { peer ->
+                offGridService?.sendPingToPeer(peer.nodeId)
+                Toast.makeText(this, "Menguji Ping ke ${peer.callsign}...", Toast.LENGTH_SHORT).show()
+            }
+        )
         p2pDiscoveredAdapter = WifiDirectPeerAdapter { discovered ->
             offGridService?.connectWifiDirectPeer(discovered.deviceAddress)
             Toast.makeText(this, "Menghubungkan ke ${discovered.callsign ?: discovered.deviceName}...", Toast.LENGTH_SHORT).show()
@@ -508,6 +747,10 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     private fun setupInteractions() {
         findViewById<View>(R.id.btnEditIdentity).setOnClickListener {
             showEditIdentityDialog()
+        }
+
+        tvRadioTransportSummary.setOnClickListener {
+            selectTab(Tab.NODES)
         }
 
         btnQuickTorch.setOnClickListener {
@@ -543,7 +786,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             }
         }
 
-        // Tactile Push-To-Talk Dome (Touch + Keyboard Enter/Space accessibility)
+        // Tactile Push-To-Talk Dome
         btnPttDome.setOnTouchListener { v, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -613,7 +856,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             }
         }
 
-        // Hold 2 sec SOS button (prevent accidental tap)
+        // Hold 2 sec SOS button
         btnSosHold.setOnTouchListener { v, event ->
             val snap = MeshRepository.getSnapshot()
             when (event.actionMasked) {
@@ -649,19 +892,26 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             }
         }
 
+        btnRadarRangeAuto.setOnClickListener { selectRadarRange(RadarRangeMode.AUTO) }
+        btnRadarRange50.setOnClickListener { selectRadarRange(RadarRangeMode.M50) }
+        btnRadarRange200.setOnClickListener { selectRadarRange(RadarRangeMode.M200) }
+        btnRadarRange1k.setOnClickListener { selectRadarRange(RadarRangeMode.KM1) }
+
         compassRadarView.onPeerSelected = { peer ->
             selectedRadarNodeId = peer.nodeId
-            updateRadarTargetHud(MeshRepository.getSnapshot(), MeshRepository.getPeersSorted())
+            val snap = MeshRepository.getSnapshot()
+            val list = MeshRepository.getPeersSorted()
+            updateRadarTargetHudAndProximity(snap, list)
             compassRadarView.updateRadarData(
-                MeshRepository.getSnapshot().localLatitude,
-                MeshRepository.getSnapshot().localLongitude,
-                MeshRepository.getSnapshot().deviceAzimuthDeg,
-                MeshRepository.getPeersSorted(),
+                snap.localLatitude,
+                snap.localLongitude,
+                snap.deviceAzimuthDeg,
+                list,
                 selectedRadarNodeId
             )
         }
 
-        // 1-tap quick chat presets
+        // 1-tap quick tactical presets
         val presets = listOf(
             "Posisi aman" to false,
             "Tunggu sebentar" to false,
@@ -717,6 +967,11 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             } else false
         }
 
+        btnNetworkRescanAll.setOnClickListener {
+            offGridService?.triggerQuickNetworkRescan()
+            Toast.makeText(this, "Memindai ulang Bluetooth & Wi-Fi Direct...", Toast.LENGTH_SHORT).show()
+        }
+
         findViewById<Button>(R.id.btnCreateP2pHost).setOnClickListener {
             if (!PermissionHelper.hasWifiDirectPermission(this)) {
                 requestMissingPermissionsIfNeeded(initialLaunch = false)
@@ -733,6 +988,27 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         }
         btnDisconnectP2p.setOnClickListener {
             offGridService?.disconnectWifiDirect()
+        }
+
+        btnOpenWifiHotspotSettings.setOnClickListener {
+            try {
+                startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
+            } catch (_: Throwable) {
+                try {
+                    startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+        btnToggleTechInfo.setOnClickListener {
+            showTechDiagnostics = !showTechDiagnostics
+            tvNodeDiagnostics.visibility = if (showTechDiagnostics) View.VISIBLE else View.GONE
+            btnToggleTechInfo.text = if (showTechDiagnostics) {
+                "Sembunyikan Detail Teknis Radio"
+            } else {
+                "Tampilkan Detail Teknis Radio"
+            }
         }
 
         for ((tab, triple) in tabViews) {
@@ -833,7 +1109,8 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     private fun updateHardwareBanner(snapshot: MeshStatusSnapshot) {
         val alreadyLinked = snapshot.connectedTcpSockets > 0 ||
             snapshot.bleGattConnectedCount > 0 ||
-            MeshRepository.getPeersSorted().isNotEmpty()
+            snapshot.hotspotActive ||
+            MeshRepository.getPeersSorted().any { it.hasTwoWayLink() }
         if (bannerPermission.visibility == View.VISIBLE || alreadyLinked) {
             bannerHardwareToggle.visibility = View.GONE
             return
@@ -848,9 +1125,9 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             btnEnableBtQuick.visibility = if (!btOn && btAdapter != null) View.VISIBLE else View.GONE
             btnEnableLocQuick.visibility = if (!locOn) View.VISIBLE else View.GONE
             tvHardwareToggleInfo.text = when {
-                !btOn && !locOn -> "Bluetooth & Lokasi mati. Aturan Android OS mewajibkan keduanya untuk scan tanpa Wi-Fi (atau sambung Hotspot tanpa BT/Lokasi)."
-                !btOn -> "Bluetooth mati. Nyalakan Bluetooth untuk chat/suara tanpa Wi-Fi, atau sambungkan ke Hotspot yang sama."
-                else -> "Lokasi HP mati: Android memblokir hasil pindai Bluetooth & Wi-Fi Direct jika Lokasi mati (tidak perlu jika pakai Hotspot)."
+                !btOn && !locOn -> "Bluetooth & Lokasi mati. Nyalakan keduanya untuk sambungan otomatis, atau hubungkan ke Hotspot HP."
+                !btOn -> "Bluetooth mati. Nyalakan Bluetooth untuk chat & suara tanpa Wi-Fi, atau hubungkan ke Hotspot."
+                else -> "Lokasi HP mati: Android memblokir pencarian Bluetooth & Wi-Fi Direct bila Lokasi mati."
             }
         } else {
             bannerHardwareToggle.visibility = View.GONE

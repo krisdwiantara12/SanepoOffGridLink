@@ -4,6 +4,7 @@ import com.sanepo.offgrid.engine.AppUpdateManager
 import com.sanepo.offgrid.engine.GattFrameAccumulator
 import com.sanepo.offgrid.engine.GeoMath
 import com.sanepo.offgrid.engine.ImaAdpcmCodec
+import com.sanepo.offgrid.engine.MeshRelayRouter
 import com.sanepo.offgrid.engine.OffGridProtocol
 import com.sanepo.offgrid.engine.PttAudioEngine
 import org.junit.Assert.assertArrayEquals
@@ -253,5 +254,167 @@ class OffGridProtocolTest {
         val outBuf = ByteBuffer.wrap(pcmSamples).order(ByteOrder.LITTLE_ENDIAN)
         assertEquals(1650, outBuf.getShort(0).toInt())
         assertEquals(-32767, outBuf.getShort(2).toInt())
+    }
+
+    @Test
+    fun v2RelayAudioAndControlEnvelopesRoundTripAndComputeSignedTurn() {
+        val pcm = byteArrayOf(10, 20, 30, 40)
+        val relayFrameBytes = OffGridProtocol.encodeRelayAudioFrame(
+            type = OffGridProtocol.AUDIO_TYPE_ADPCM_8K,
+            channelNumber = 4,
+            senderNodeId = "CAFEBABE",
+            sequence = 99,
+            ttl = 2,
+            pcmBytes = pcm
+        )
+        val parsed = requireNotNull(OffGridProtocol.decodeAudioFrame(relayFrameBytes))
+        assertEquals(OffGridProtocol.AUDIO_TYPE_ADPCM_8K, parsed.type)
+        assertEquals(4, parsed.channelNumber)
+        assertEquals("CAFEBABE", parsed.senderNodeId)
+        assertEquals(99, parsed.sequence)
+        assertEquals(2, parsed.ttl)
+        assertArrayEquals(pcm, parsed.pcmBytes)
+
+        // Wrap-around signed shortest turn angle for Radar HUD guidance
+        assertEquals(15.0, GeoMath.signedRelativeTurnDegrees(10.0, 355.0), 0.01)
+        assertEquals(-20.0, GeoMath.signedRelativeTurnDegrees(350.0, 10.0), 0.01)
+        assertEquals(90.0, GeoMath.signedRelativeTurnDegrees(90.0, 0.0), 0.01)
+
+        val ping = OffGridProtocol.ControlEnvelope.Ping(
+            pingId = "p1",
+            senderId = "AAAAAAAA",
+            targetId = "BBBBBBBB",
+            sentAtMs = 123456L,
+            isReply = false,
+            ttl = 4,
+            hopCount = 1
+        )
+        val pingDec = OffGridProtocol.decodeControlJson(OffGridProtocol.encodeControlJson(ping))
+            as OffGridProtocol.ControlEnvelope.Ping
+        assertEquals("p1", pingDec.pingId)
+        assertEquals(1, pingDec.hopCount)
+        assertFalse(pingDec.isReply)
+
+        val syncReq = OffGridProtocol.ControlEnvelope.ChatSyncReq("AAAAAAAA", listOf("m1", "m2"))
+        val syncDec = OffGridProtocol.decodeControlJson(OffGridProtocol.encodeControlJson(syncReq))
+            as OffGridProtocol.ControlEnvelope.ChatSyncReq
+        assertEquals(listOf("m1", "m2"), syncDec.knownMsgIds)
+    }
+
+    @Test
+    fun meshRelayRouterForwardsChatAckSyncAndTranscodesVoiceAcrossTransports() {
+        val sentIpCtrl = mutableListOf<Pair<OffGridProtocol.ControlEnvelope, String?>>()
+        val sentBleCtrl = mutableListOf<Triple<String, Boolean, String?>>()
+        val sentIpAudio = mutableListOf<Pair<ByteArray, String?>>()
+        val sentBleAudio = mutableListOf<Pair<ByteArray, String?>>()
+        val deliveredChats = mutableListOf<OffGridProtocol.ControlEnvelope.Chat>()
+        val localAudio = mutableListOf<OffGridProtocol.AudioFramePacket>()
+        val scheduledTasks = mutableListOf<Pair<Long, () -> Unit>>()
+        var pingResult: Triple<String, Long, Int>? = null
+        var clockMs = 10_000L
+
+        val missingHistory = listOf(
+            OffGridProtocol.ControlEnvelope.Chat(
+                msgId = "hist-1",
+                senderId = "NODE-C",
+                senderCallsign = "CHARLIE",
+                channelNumber = 1,
+                text = "Pesan tertinggal",
+                timestampMs = 9_000L,
+                isSos = false,
+                latitude = null,
+                longitude = null,
+                ttl = 2
+            )
+        )
+
+        val router = MeshRelayRouter(
+            localNodeIdProvider = { "NODE-B" },
+            localCallsignProvider = { "BRAVO" },
+            sendIpControl = { env, ex -> sentIpCtrl.add(env to ex) },
+            sendBleControl = { json, prio, ex -> sentBleCtrl.add(Triple(json, prio, ex)) },
+            sendIpAudio = { bytes, ex -> sentIpAudio.add(bytes to ex) },
+            sendBleAudio = { bytes, ex -> sentBleAudio.add(bytes to ex) },
+            onHelloReceived = { _, _, _ -> },
+            onChatDeliveredLocally = { c -> deliveredChats.add(c) },
+            onChatAckReceived = { _, _ -> },
+            onChatWaitingForSignal = {},
+            onPttFloorReceived = {},
+            onSosReceived = { _, _ -> },
+            onAudioFramePlayLocal = { f -> localAudio.add(f) },
+            onPingReplyMeasured = { id, rtt, hops -> pingResult = Triple(id, rtt, hops) },
+            getKnownMsgIds = { listOf("local-1") },
+            getMissingMessagesForPeer = { known -> missingHistory.filterNot { known.contains(it.msgId) } },
+            scheduleDelayed = { delay, fn -> scheduledTasks.add(delay to fn) },
+            nowMsProvider = { clockMs }
+        )
+
+        // 1. Incoming chat from NODE-A over TCP gets ACKed, stored once, and relayed to BLE + other TCP
+        val incomingChat = OffGridProtocol.ControlEnvelope.Chat(
+            msgId = "chat-42",
+            senderId = "NODE-A",
+            senderCallsign = "ALPHA",
+            channelNumber = 1,
+            text = "Aman lanjut",
+            timestampMs = 10_000L,
+            isSos = false,
+            latitude = null,
+            longitude = null,
+            ttl = 3,
+            hopCount = 0
+        )
+        val rawChatJson = OffGridProtocol.encodeControlJson(incomingChat)
+        router.handleIncomingControlJson(rawChatJson, "192.168.49.10", "TCP:peerA")
+        // Duplicate echo back must be ignored cleanly
+        router.handleIncomingControlJson(rawChatJson, "192.168.49.10", "BLE_C:NODE-A")
+        assertEquals(1, deliveredChats.size)
+        assertTrue(sentIpCtrl.any { it.first is OffGridProtocol.ControlEnvelope.ChatAck })
+        val relayedChat = sentIpCtrl.first { it.first is OffGridProtocol.ControlEnvelope.Chat }
+        assertEquals("peerA", relayedChat.second) // Source TCP peer excluded
+        assertEquals(2, (relayedChat.first as OffGridProtocol.ControlEnvelope.Chat).ttl)
+
+        // 2. Incoming 16kHz Wi-Fi live voice from A plays locally & transcodes to 8kHz ADPCM for BLE bridge
+        val pcm16k = ByteArray(1280) { (it and 0x3F).toByte() }
+        val adpcm16 = ImaAdpcmCodec.encodePcm16Le(pcm16k)
+        val audio16Pkt = OffGridProtocol.encodeRelayAudioFrame(
+            type = OffGridProtocol.AUDIO_TYPE_ADPCM_16K,
+            channelNumber = 1,
+            senderNodeId = "AAAA1111",
+            sequence = 7,
+            ttl = 3,
+            pcmBytes = adpcm16
+        )
+        val decodedAudio = requireNotNull(OffGridProtocol.decodeAudioFrame(audio16Pkt))
+        router.handleIncomingAudioFrame(decodedAudio, audio16Pkt, "TCP:peerA")
+        // Repeat echo dropped
+        router.handleIncomingAudioFrame(decodedAudio, audio16Pkt, "BLE_C:AAAA1111")
+        assertEquals(1, localAudio.size)
+        assertEquals(1, sentBleAudio.size)
+        val bridgedBleFrame = requireNotNull(OffGridProtocol.decodeAudioFrame(sentBleAudio.first().first))
+        assertEquals(OffGridProtocol.AUDIO_TYPE_ADPCM_8K, bridgedBleFrame.type)
+        assertEquals(2, bridgedBleFrame.ttl)
+
+        // 3. History sync req returns missing batch
+        sentIpCtrl.clear()
+        val syncReq = OffGridProtocol.ControlEnvelope.ChatSyncReq("NODE-A", emptyList())
+        router.handleIncomingControlJson(OffGridProtocol.encodeControlJson(syncReq), "192.168.49.10", "TCP:peerA")
+        val batch = sentIpCtrl.map { it.first }.filterIsInstance<OffGridProtocol.ControlEnvelope.ChatSyncBatch>().first()
+        assertEquals(1, batch.items.size)
+        assertEquals("hist-1", batch.items.first().msgId)
+
+        // 4. Ping measurement
+        val pid = router.sendPing("NODE-C")
+        clockMs += 37L
+        val reply = OffGridProtocol.ControlEnvelope.Ping(
+            pingId = pid,
+            senderId = "NODE-C",
+            targetId = "NODE-B",
+            sentAtMs = 10_000L,
+            isReply = true,
+            ttl = 3,
+            hopCount = 1
+        )
+        router.handleIncomingControlJson(OffGridProtocol.encodeControlJson(reply), null, "BLE_C:NODE-C")
+        assertEquals(Triple("NODE-C", 37L, 1), pingResult)
     }
 }

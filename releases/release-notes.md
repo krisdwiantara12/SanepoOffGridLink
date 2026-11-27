@@ -1,10 +1,14 @@
-### Pembaruan Utama v1.0.3 (Penyempurnaan Audio & Koneksi)
-- **Perbaikan Jalur Suara Walkie-Talkie PTT:**
-  - Mengubah sumber mikrofon ke `MediaRecorder.AudioSource.MIC` langsung dengan penguatan suara bersih `1,65x` (menghindari pemblokiran mic senyap VoIP `VOICE_COMMUNICATION` & `AcousticEchoCanceler` bawaan beberapa merk HP).
-  - Menambahkan jalur pengiriman suara cadangan lewat **TCP `noDelay` (`47880`)** bila paket **UDP `47882`** belum terkonfirmasi lolos pada router/hotspot, lengkap deduplikasi sekuens paket agar tidak bergema.
-  - Menambahkan **2-byte sync header (`0xAB 0x5A`)** & perbaikan token pengawas antrean pada **BLE GATT (`MTU 517` + fallback service discovery 1,5 detik)** sehingga suara Bluetooth tidak macet di tengah jalan.
-- **Alat Bantu Cek & Kontrol Lapangan:**
-  - Tombol baru **Tes Mic & Speaker Lokal (2 Detik)** untuk menguji mic, codec ADPCM, dan speaker HP secara langsung sebelum mulai komunikasi.
-  - Penghitung **Paket TX / RX** serta indikator jalur aktif (`Wi-Fi HD` / `Bluetooth LE`) langsung di layar Radio + pengunci sentuhan agar tombol PTT tidak terputus saat jari bergeser di `ScrollView`.
-  - Peringatan Bluetooth/Lokasi otomatis disembunyikan begitu unit sudah terhubung lewat Wi-Fi/Hotspot atau Bluetooth, disertai penjelasan jujur aturan Android OS.
-- **Pembaruan OTA Tanpa `DownloadManager` (`v1.0.2`):** Unduhan update langsung lewat streaming HTTPS + verifikasi header APK & `SHA-256`.
+### Pembaruan Utama v1.1.0 (Jangkauan Luas Estafet Live, Chat Anti-Hilang, Radar Taktis 360°, & Pusat Sambungan Mudah)
+- **Jangkauan Luas Estafet Multi-Hop Live (`MeshRelayRouter`):**
+  - Suara Walkie-Talkie live, Chat, ACK, Ping, dan sinyal SOS kini otomatis diteruskan secara estafet hingga **4 lompatan** antar-HP sekaligus menjembatani **Wi-Fi Direct / Hotspot <-> Bluetooth LE** secara real-time.
+- **Perbaikan Total Kestabilan Bluetooth & Wi-Fi:**
+  - Memperbaiki antrean paket **BLE GATT** dengan eksekusi berurutan (`HIGH PRIORITY` -> `BLE 2M PHY` -> `MTU 517` -> `Discover` -> `CCCD`), memisahkan antrean kontrol agar Chat tidak pernah terdorong suara, dan meniadakan pembuangan potongan paket ketika radio sibuk.
+  - Menurunkan/menjeda pemindaian BLE sementara saat PTT aktif bicara/dengar agar pita 2.4 GHz tidak berebut.
+  - Mengikat soket Hotspot/Wi-Fi agar tidak dibajak Data Seluler 4G/5G, menambahkan retry otomatis TCP pada Wi-Fi Direct, serta pembersihan soket putus setiap 12 detik.
+  - Memisahkan `AudioTrack` suara masuk dari `roger beep`, mereset urutan saat berganti pembicara, serta menampilkan peringatan 1-ketuk jika ada teman berbicara di saluran (`CH`) berbeda.
+- **Chat Anti-Hilang (Guaranteed Delivery + Auto-Sync):**
+  - Kirim ulang otomatis (`1.2d / 3d / 6.5d / 12d`), ketuk gelembung untuk kirim ulang manual, status jujur (`Mengirim`, `Menunggu jangkauan`, `Diterima oleh ...`), dan **Sinkronisasi Riwayat otomatis** begitu sinyal tersambung kembali.
+- **Radar Kompas Taktis 360° & Panduan Belok:**
+  - Piringan derajat `0°-360°`, kerucut arah hadap HP, cincin jarak berlabel + pilihan skala (`Auto / 50m / 200m / 1km`), kompensasi kemiringan saat HP dipegang tegak + peringatan kalibrasi kompas, instruksi **`BELOK KIRI / KANAN / LURUS DI DEPAN`**, label anti-tumpuk, serta pemisahan jujur jarak sinyal non-GPS.
+- **Menu Sambungan Jelas + Tes Ping:**
+  - Mengganti istilah teknis mentah dengan **Pusat Sambungan** (Wi-Fi Direct Rombongan, Mode Hotspot HP + pintasan pengaturan, dan daftar teman lengkap tombol **`Tes Ping`** multi-hop dalam `ms`).

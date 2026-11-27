@@ -15,16 +15,24 @@ import androidx.recyclerview.widget.RecyclerView
 import com.sanepo.offgrid.R
 import com.sanepo.offgrid.engine.GeoMath
 import com.sanepo.offgrid.model.ChatMessage
+import com.sanepo.offgrid.model.NodeHealthState
 import com.sanepo.offgrid.model.PeerNode
+import com.sanepo.offgrid.model.TransportLinkType
 import com.sanepo.offgrid.model.WifiDirectDiscoveredPeer
 import java.util.Date
 
-class ChatMessageAdapter : RecyclerView.Adapter<ChatMessageAdapter.Holder>() {
+class ChatMessageAdapter(
+    private val onRetryClicked: (ChatMessage) -> Unit = {}
+) : RecyclerView.Adapter<ChatMessageAdapter.Holder>() {
     private val items = mutableListOf<ChatMessage>()
+    private var peerNames: Map<String, String> = emptyMap()
 
-    fun submitList(newItems: List<ChatMessage>) {
+    fun submitList(newItems: List<ChatMessage>, knownPeers: List<PeerNode> = emptyList()) {
         items.clear()
         items.addAll(newItems)
+        if (knownPeers.isNotEmpty()) {
+            peerNames = knownPeers.associate { it.nodeId to it.callsign }
+        }
         notifyDataSetChanged()
     }
 
@@ -34,7 +42,7 @@ class ChatMessageAdapter : RecyclerView.Adapter<ChatMessageAdapter.Holder>() {
     }
 
     override fun onBindViewHolder(holder: Holder, position: Int) {
-        holder.bind(items[position])
+        holder.bind(items[position], peerNames, onRetryClicked)
     }
 
     override fun getItemCount(): Int = items.size
@@ -45,8 +53,13 @@ class ChatMessageAdapter : RecyclerView.Adapter<ChatMessageAdapter.Holder>() {
         private val tvMeta: TextView = view.findViewById(R.id.tvChatMeta)
         private val tvBody: TextView = view.findViewById(R.id.tvChatBody)
         private val btnMapCoord: TextView = view.findViewById(R.id.tvChatCoords)
+        private val tvDeliveryState: TextView = view.findViewById(R.id.tvChatDeliveryStatus)
 
-        fun bind(msg: ChatMessage) {
+        fun bind(
+            msg: ChatMessage,
+            peerNames: Map<String, String>,
+            onRetryClicked: (ChatMessage) -> Unit
+        ) {
             val ctx = itemView.context
             root.gravity = if (msg.isOutgoing) Gravity.END else Gravity.START
 
@@ -69,11 +82,44 @@ class ChatMessageAdapter : RecyclerView.Adapter<ChatMessageAdapter.Holder>() {
             }
 
             val timeStr = DateFormat.format("HH:mm", Date(msg.timestampMs)).toString()
-            val ackSuffix = if (msg.isOutgoing && msg.ackedByNodes.isNotEmpty()) {
-                " | Diterima ${msg.ackedByNodes.size} unit"
-            } else ""
-            tvMeta.text = "${msg.senderCallsign} · CH-%02d · $timeStr$ackSuffix".format(msg.channelNumber)
+            tvMeta.text = "${msg.senderCallsign} · CH-%02d · $timeStr".format(msg.channelNumber)
             tvBody.text = msg.text
+
+            if (msg.isOutgoing) {
+                tvDeliveryState.visibility = View.VISIBLE
+                when {
+                    msg.ackedByNodes.isNotEmpty() -> {
+                        val firstId = msg.ackedByNodes.first()
+                        val firstName = peerNames[firstId] ?: firstId.take(6)
+                        tvDeliveryState.text = if (msg.ackedByNodes.size == 1) {
+                            "Diterima oleh $firstName"
+                        } else {
+                            "Diterima oleh ${msg.ackedByNodes.size} teman"
+                        }
+                        tvDeliveryState.setTextColor(
+                            ContextCompat.getColor(ctx, if (msg.isSos) R.color.ink_on_sos else R.color.status_live)
+                        )
+                        tvDeliveryState.setOnClickListener(null)
+                    }
+                    msg.waitingForSignal -> {
+                        tvDeliveryState.text = "Menunggu jangkauan · Ketuk kirim ulang"
+                        tvDeliveryState.setTextColor(
+                            ContextCompat.getColor(ctx, if (msg.isSos) R.color.ink_on_sos else R.color.status_warn)
+                        )
+                        tvDeliveryState.setOnClickListener { onRetryClicked(msg) }
+                    }
+                    else -> {
+                        tvDeliveryState.text = "Mengirim & menunggu bukti terima..."
+                        tvDeliveryState.setTextColor(
+                            ContextCompat.getColor(ctx, if (msg.isSos) R.color.ink_on_sos else R.color.ink_secondary)
+                        )
+                        tvDeliveryState.setOnClickListener { onRetryClicked(msg) }
+                    }
+                }
+            } else {
+                tvDeliveryState.visibility = View.GONE
+                tvDeliveryState.setOnClickListener(null)
+            }
 
             if (msg.latitude != null && msg.longitude != null) {
                 btnMapCoord.visibility = View.VISIBLE
@@ -93,7 +139,8 @@ class ChatMessageAdapter : RecyclerView.Adapter<ChatMessageAdapter.Holder>() {
 }
 
 class PeerNodeAdapter(
-    private val onSelectPeer: (PeerNode) -> Unit
+    private val onSelectPeer: (PeerNode) -> Unit,
+    private val onPingPeer: ((PeerNode) -> Unit)? = null
 ) : RecyclerView.Adapter<PeerNodeAdapter.Holder>() {
 
     private val items = mutableListOf<PeerNode>()
@@ -114,7 +161,7 @@ class PeerNodeAdapter(
     }
 
     override fun onBindViewHolder(holder: Holder, position: Int) {
-        holder.bind(items[position], localLat, localLon, onSelectPeer)
+        holder.bind(items[position], localLat, localLon, onSelectPeer, onPingPeer)
     }
 
     override fun getItemCount(): Int = items.size
@@ -123,12 +170,14 @@ class PeerNodeAdapter(
         private val tvCallsign: TextView = view.findViewById(R.id.tvPeerCallsign)
         private val tvBadge: TextView = view.findViewById(R.id.tvPeerLinkBadge)
         private val tvTelemetry: TextView = view.findViewById(R.id.tvPeerTelemetry)
+        private val btnPing: Button = view.findViewById(R.id.btnPeerPing)
 
         fun bind(
             peer: PeerNode,
             localLat: Double?,
             localLon: Double?,
-            onClick: (PeerNode) -> Unit
+            onClick: (PeerNode) -> Unit,
+            onPing: ((PeerNode) -> Unit)?
         ) {
             val ctx = itemView.context
             tvCallsign.text = if (peer.isSos) {
@@ -147,23 +196,58 @@ class PeerNodeAdapter(
                 )
             )
 
-            val linkTags = peer.linkTypes.joinToString("+") { it.shortLabel }.ifBlank { "SCAN" }
-            tvBadge.text = linkTags
+            val readyStateText = when {
+                peer.linkTypes.contains(TransportLinkType.WIFI_DIRECT) -> "Wi-Fi Direct (Siap)"
+                peer.linkTypes.contains(TransportLinkType.LOCAL_LAN) -> "Hotspot/Wi-Fi (Siap)"
+                peer.linkTypes.contains(TransportLinkType.BLE_GATT) -> "Bluetooth (Siap)"
+                peer.linkTypes.contains(TransportLinkType.MESH_RELAY) ->
+                    "Estafet ${peer.hopCount}x (via ${peer.relayViaCallsign ?: "Mesh"})"
+                else -> "Terdeteksi Sinyal"
+            }
+            tvBadge.text = readyStateText
+            tvBadge.setTextColor(
+                ContextCompat.getColor(
+                    ctx,
+                    if (peer.hasTwoWayLink()) R.color.status_live else R.color.status_warn
+                )
+            )
+
+            val now = System.currentTimeMillis()
+            val ageSec = ((now - peer.lastSeenMs) / 1000L).coerceAtLeast(0L)
+            val ageText = when {
+                ageSec < 5L -> "Aktif"
+                ageSec < 60L -> "${ageSec} dtk lalu"
+                else -> "${ageSec / 60L} mnt lalu"
+            }
 
             val distText = if (localLat != null && localLon != null && peer.latitude != null && peer.longitude != null) {
                 val meters = GeoMath.haversineDistanceMeters(localLat, localLon, peer.latitude, peer.longitude)
                 val bearing = GeoMath.initialBearingDegrees(localLat, localLon, peer.latitude, peer.longitude)
                 val card = GeoMath.cardinalDirectionId(bearing)
-                "GPS ${GeoMath.formatDistanceCompact(meters)} · ${bearing.toInt()}° $card"
-            } else if (peer.bleRssiDbm != null && peer.estimatedBleMeters != null) {
-                "BLE ${peer.bleRssiDbm} dBm (~${GeoMath.formatDistanceCompact(peer.estimatedBleMeters)})"
+                "GPS ${GeoMath.formatDistanceCompact(meters)} (${bearing.toInt()}° $card)"
+            } else if (peer.estimatedBleMeters != null) {
+                "Sinyal ~${GeoMath.formatDistanceCompact(peer.estimatedBleMeters)}"
+            } else if (peer.hasTwoWayLink()) {
+                "Menunggu GPS teman"
             } else {
-                "Terhubung tanpa koordinat GPS"
+                "Sedang menyambung..."
             }
 
+            val pingPart = peer.lastPingRttMs?.let { rtt ->
+                val hopNote = if (peer.lastPingHops > 0) " ${peer.lastPingHops + 1} hop" else ""
+                " · Ping ${rtt}ms$hopNote"
+            } ?: ""
             val batText = if (peer.batteryPercent in 0..100) " · Bat ${peer.batteryPercent}%" else ""
-            val ipText = if (!peer.ipAddress.isNullOrBlank()) " · IP ${peer.ipAddress}" else ""
-            tvTelemetry.text = "$distText$batText$ipText"
+            val staleTag = if (peer.healthState(now) == NodeHealthState.STALE) " · Sinyal Redup" else ""
+            tvTelemetry.text = "$distText · $ageText$batText$pingPart$staleTag"
+
+            if (onPing != null && peer.hasTwoWayLink()) {
+                btnPing.visibility = View.VISIBLE
+                btnPing.setOnClickListener { onPing(peer) }
+            } else {
+                btnPing.visibility = View.GONE
+                btnPing.setOnClickListener(null)
+            }
 
             itemView.setOnClickListener { onClick(peer) }
         }
@@ -205,8 +289,11 @@ class WifiDirectPeerAdapter(
                 peer.deviceName
             }
             tvName.text = label
-            val ownerTag = if (peer.isGroupOwner) "Host Grup" else "Perangkat"
-            tvSub.text = "${peer.deviceAddress} · $ownerTag"
+            tvSub.text = if (peer.isGroupOwner) {
+                "Sudah membuat rombongan · Ketuk Gabung"
+            } else {
+                "Perangkat Sanepo di sekitar · Siap gabung"
+            }
             btnConnect.setOnClickListener { onClick(peer) }
         }
     }

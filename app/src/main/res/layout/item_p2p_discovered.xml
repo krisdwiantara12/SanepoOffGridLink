@@ -29,10 +29,9 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="2dp"
-            android:fontFamily="monospace"
-            android:text="00:00:00:00:00:00"
+            android:text="Siap gabung ke rombongan"
             android:textColor="@color/ink_secondary"
-            android:textSize="11sp" />
+            android:textSize="12sp" />
     </LinearLayout>
 
     <Button
@@ -41,9 +40,10 @@
         android:layout_height="wrap_content"
         android:background="@drawable/bg_accent_btn"
         android:minHeight="48dp"
-        android:paddingStart="14dp"
-        android:paddingEnd="14dp"
-        android:text="Sambungkan"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:text="Gabung"
+        android:textAllCaps="false"
         android:textColor="@color/ink_on_accent"
         android:textSize="12sp"
         android:textStyle="bold" />

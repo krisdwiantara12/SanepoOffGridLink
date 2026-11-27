@@ -56,5 +56,20 @@
             android:textColor="@color/ink_primary"
             android:textSize="11sp"
             android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/tvChatDeliveryStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:clickable="true"
+            android:focusable="true"
+            android:fontFamily="sans-serif-medium"
+            android:paddingTop="2dp"
+            android:paddingBottom="2dp"
+            android:text="Mengirim..."
+            android:textColor="@color/ink_secondary"
+            android:textSize="11sp"
+            android:visibility="gone" />
     </LinearLayout>
 </LinearLayout>

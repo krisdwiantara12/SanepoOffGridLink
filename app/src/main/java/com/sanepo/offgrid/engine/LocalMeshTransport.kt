@@ -6,6 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
@@ -14,8 +17,10 @@ import android.net.wifi.p2p.WifiP2pManager
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
 import android.os.Build
+import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
+import com.sanepo.offgrid.model.TransportLinkType
 import com.sanepo.offgrid.model.WifiDirectDiscoveredPeer
 import java.io.BufferedReader
 import java.io.BufferedWriter
@@ -37,13 +42,15 @@ import java.util.concurrent.Executors
 
 class LocalMeshTransport(
     private val context: Context,
-    private val onAudioFrameReceived: (OffGridProtocol.AudioFramePacket) -> Unit,
-    private val onRemoteChatReceived: (OffGridProtocol.ControlEnvelope.Chat) -> Unit,
-    private val onRemoteSosReceived: (OffGridProtocol.ControlEnvelope.SosSignal) -> Unit
+    private val onControlJsonReceived: (json: String, remoteIp: String, sourcePeerKey: String?) -> Unit,
+    private val onAudioFrameReceived: (frame: OffGridProtocol.AudioFramePacket, rawBytes: ByteArray, sourcePeerKey: String?) -> Unit,
+    private val onPeerLinkReady: (peerNodeId: String?, sourcePeerKey: String) -> Unit = { _, _ -> }
 ) {
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val executor: ExecutorService = Executors.newCachedThreadPool()
     private val audioTxExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+    private val connectivityManager = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
     private val p2pManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
     private var p2pChannel: WifiP2pManager.Channel? = null
 
@@ -58,9 +65,10 @@ class LocalMeshTransport(
     private var udpAudioSocket: DatagramSocket? = null
 
     private val clientHandlers = ConcurrentHashMap<String, ClientConnection>()
-    private val peerUdpTargets = ConcurrentHashMap<String, String>() // nodeId -> ipAddress
+    private val peerUdpTargets = ConcurrentHashMap<String, String>() // direct nodeId -> ipAddress
     private val cachedPeerInetAddrs = ConcurrentHashMap<String, InetAddress>()
     private val udpAudioVerifiedNodes: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap())
+
     @Volatile
     private var cachedBroadcastAddrs: List<InetAddress> = emptyList()
     private val txtMetadataByMac = ConcurrentHashMap<String, Map<String, String>>()
@@ -85,7 +93,7 @@ class LocalMeshTransport(
                     MeshRepository.updateSnapshot(forceImmediate = true) {
                         copy(
                             wifiEnabled = enabled,
-                            wifiDirectDetail = if (enabled) "Wi-Fi Direct siap" else "Wi-Fi mati: aktifkan Wi-Fi untuk mode P2P jarak jauh"
+                            wifiDirectDetail = if (enabled) "Wi-Fi Direct siap" else "Wi-Fi mati: nyalakan Wi-Fi atau gunakan Hotspot/Bluetooth"
                         )
                     }
                     if (enabled && running) {
@@ -134,11 +142,13 @@ class LocalMeshTransport(
         }
 
         cachedBroadcastAddrs = enumerateBroadcastAddresses()
+        val (ips, hotspotOn) = inspectLocalInterfaces()
         MeshRepository.updateSnapshot(forceImmediate = true) {
             copy(
                 wifiDirectSupported = p2pSupported,
                 wifiEnabled = wifiManager?.isWifiEnabled == true,
-                localLanIps = enumerateLocalIpv4Addresses()
+                hotspotActive = hotspotOn,
+                localLanIps = ips
             )
         }
 
@@ -154,6 +164,7 @@ class LocalMeshTransport(
 
     fun stop() {
         running = false
+        mainHandler.removeCallbacksAndMessages(null)
         unregisterP2pReceiver()
         unregisterDnsSdService()
         try {
@@ -176,9 +187,11 @@ class LocalMeshTransport(
             udpAudioSocket?.close()
         } catch (_: Throwable) {
         }
-        clientHandlers.values.forEach { it.closeQuietly() }
+        clientHandlers.values.forEach { it.closeQuietly(updateUi = false) }
         clientHandlers.clear()
         peerUdpTargets.clear()
+        cachedPeerInetAddrs.clear()
+        udpAudioVerifiedNodes.clear()
         MeshRepository.updateSnapshot(forceImmediate = true) {
             copy(connectedTcpSockets = 0, wifiDirectRole = "Nonaktif")
         }
@@ -207,11 +220,11 @@ class LocalMeshTransport(
     private fun startCreateGroupCall(mgr: WifiP2pManager, ch: WifiP2pManager.Channel) {
         mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                updateWifiDirectDetail("Membuat grup Host Wi-Fi Direct...")
+                updateWifiDirectDetail("Rombongan dibuat! Teman sekarang bisa menekan Cari & Gabung.")
             }
 
             override fun onFailure(reason: Int) {
-                updateWifiDirectDetail("Gagal buat Host P2P (kode $reason). Coba gunakan Hotspot HP.")
+                updateWifiDirectDetail("Gagal membuat rombongan (kode $reason). Coba gunakan Mode Hotspot HP.")
             }
         })
     }
@@ -221,7 +234,7 @@ class LocalMeshTransport(
         val mgr = p2pManager ?: return
         val ch = p2pChannel ?: return
         if (!PermissionHelper.hasWifiDirectPermission(context)) {
-            updateWifiDirectDetail("Izin Wi-Fi Sekitar / Lokasi dibutuhkan untuk pindai P2P")
+            updateWifiDirectDetail("Izin Wi-Fi Sekitar / Lokasi dibutuhkan untuk mencari rombongan")
             return
         }
 
@@ -251,7 +264,7 @@ class LocalMeshTransport(
                     override fun onSuccess() {
                         mgr.discoverServices(ch, object : WifiP2pManager.ActionListener {
                             override fun onSuccess() {
-                                updateWifiDirectDetail("Memindai perangkat Sanepo via Wi-Fi Direct...")
+                                updateWifiDirectDetail("Mencari HP Sanepo lain di sekitar...")
                             }
 
                             override fun onFailure(reason: Int) {
@@ -284,14 +297,14 @@ class LocalMeshTransport(
             this.deviceAddress = deviceAddress
             groupOwnerIntent = 0
         }
-        updateWifiDirectDetail("Menghubungkan ke $deviceAddress...")
+        updateWifiDirectDetail("Menghubungkan ke rombongan teman...")
         mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                updateWifiDirectDetail("Permintaan sambungan P2P terkirim. Konfirmasi di HP tujuan bila muncul.")
+                updateWifiDirectDetail("Permintaan terkirim. Ketuk Terima di HP Host bila muncul konfirmasi.")
             }
 
             override fun onFailure(reason: Int) {
-                updateWifiDirectDetail("Gagal sambung P2P (kode $reason)")
+                updateWifiDirectDetail("Gagal gabung (kode $reason). Pastikan teman sudah menekan Buat Rombongan.")
             }
         })
     }
@@ -305,60 +318,115 @@ class LocalMeshTransport(
         mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
                 MeshRepository.updateSnapshot(forceImmediate = true) {
-                    copy(wifiDirectRole = "Siaga", wifiDirectDetail = "Grup P2P diputus")
+                    copy(wifiDirectRole = "Siaga", wifiDirectDetail = "Sudah keluar dari rombongan")
                 }
             }
 
             override fun onFailure(reason: Int) {
                 MeshRepository.updateSnapshot(forceImmediate = true) {
-                    copy(wifiDirectRole = "Siaga", wifiDirectDetail = "P2P siaga")
+                    copy(wifiDirectRole = "Siaga", wifiDirectDetail = "Wi-Fi Direct siaga")
                 }
             }
         })
     }
 
-    fun sendControlToAll(envelope: OffGridProtocol.ControlEnvelope) {
+    fun sendControlToAll(
+        envelope: OffGridProtocol.ControlEnvelope,
+        excludeTcpKey: String? = null
+    ) {
         val json = OffGridProtocol.encodeControlJson(envelope)
         executor.execute {
-            for (client in clientHandlers.values) {
+            for ((key, client) in clientHandlers) {
+                if (key == excludeTcpKey || client.isClosed()) continue
                 client.sendLine(json)
             }
-            if (envelope is OffGridProtocol.ControlEnvelope.Chat ||
-                envelope is OffGridProtocol.ControlEnvelope.SosSignal ||
-                envelope is OffGridProtocol.ControlEnvelope.PttFloor
+            if (excludeTcpKey == null && (
+                envelope is OffGridProtocol.ControlEnvelope.Chat ||
+                    envelope is OffGridProtocol.ControlEnvelope.ChatAck ||
+                    envelope is OffGridProtocol.ControlEnvelope.SosSignal ||
+                    envelope is OffGridProtocol.ControlEnvelope.PttFloor ||
+                    envelope is OffGridProtocol.ControlEnvelope.Ping
+                )
             ) {
                 broadcastUdpControl(json)
             }
         }
     }
 
-    fun hasNetworkPeers(): Boolean = clientHandlers.isNotEmpty() || udpAudioVerifiedNodes.isNotEmpty()
+    fun hasNetworkPeers(): Boolean =
+        clientHandlers.values.any { !it.isClosed() } || udpAudioVerifiedNodes.isNotEmpty()
 
-    fun sendAudioFrameToPeers(packetBytes: ByteArray) {
+    fun sendAudioFrameToPeers(
+        packetBytes: ByteArray,
+        excludeTcpKey: String? = null
+    ) {
         audioTxExecutor.execute {
             val socket = udpAudioSocket
             val targetAddrs = cachedPeerInetAddrs.values
             if (socket != null) {
                 for (addr in targetAddrs) {
-                    try {
-                        socket.send(DatagramPacket(packetBytes, packetBytes.size, addr, OffGridProtocol.UDP_AUDIO_PORT))
-                    } catch (_: Throwable) {
-                    }
+                    sendUdpPacketSafe(socket, packetBytes, addr, OffGridProtocol.UDP_AUDIO_PORT)
                 }
                 if (targetAddrs.isEmpty()) {
                     for (bcast in cachedBroadcastAddrs) {
-                        try {
-                            socket.send(DatagramPacket(packetBytes, packetBytes.size, bcast, OffGridProtocol.UDP_AUDIO_PORT))
-                        } catch (_: Throwable) {
-                        }
+                        sendUdpPacketSafe(socket, packetBytes, bcast, OffGridProtocol.UDP_AUDIO_PORT)
                     }
                 }
             }
-            // Hybrid TCP fallback: if any connected TCP client hasn't proved UDP path, mirror via TCP noDelay
-            if (clientHandlers.isNotEmpty() && udpAudioVerifiedNodes.size < clientHandlers.size) {
+            // Also feed active TCP peers whose UDP path isn't verified OR when relaying multi-hop
+            val needTcpFallback = excludeTcpKey != null ||
+                (clientHandlers.isNotEmpty() && udpAudioVerifiedNodes.size < clientHandlers.size)
+            if (needTcpFallback) {
                 val tcpJson = OffGridProtocol.encodeControlJson(OffGridProtocol.ControlEnvelope.TcpAudio(packetBytes))
-                for (client in clientHandlers.values) {
+                for ((key, client) in clientHandlers) {
+                    if (key == excludeTcpKey || client.isClosed()) continue
+                    if (excludeTcpKey == null && client.remoteNodeId != null && udpAudioVerifiedNodes.contains(client.remoteNodeId)) {
+                        continue
+                    }
                     client.sendLine(tcpJson, isAudio = true)
+                }
+            }
+        }
+    }
+
+    fun onHelloDiscoveredOverUdpOrTcp(
+        env: OffGridProtocol.ControlEnvelope.Hello,
+        remoteIp: String,
+        sourceKey: String?
+    ) {
+        val localId = MeshRepository.getSnapshot().localNodeId
+        if (env.nodeId == localId) return
+
+        // Tag direct TCP handler's remoteNodeId when Hello hopCount == 0
+        if (env.hopCount == 0 && sourceKey != null && sourceKey.startsWith("TCP:")) {
+            val tcpKey = sourceKey.removePrefix("TCP:")
+            clientHandlers[tcpKey]?.let { conn ->
+                val wasUnknown = conn.remoteNodeId == null
+                conn.remoteNodeId = env.nodeId
+                if (wasUnknown) {
+                    onPeerLinkReady(env.nodeId, sourceKey)
+                }
+            }
+        }
+
+        if (env.hopCount == 0) {
+            rememberPeerUdpTarget(env.nodeId, remoteIp)
+            val alreadyTcpConnected = clientHandlers.values.any {
+                !it.isClosed() && (it.remoteIp == remoteIp || it.remoteNodeId == env.nodeId)
+            }
+            if (sourceKey == null && !alreadyTcpConnected) {
+                if (localId > env.nodeId || isP2pGroupOwner) {
+                    connectTcpToIpIfNeeded(remoteIp)
+                } else {
+                    // Lower ID also initiates after 900ms if higher ID failed to open incoming socket
+                    mainHandler.postDelayed({
+                        val stillMissing = clientHandlers.values.none {
+                            !it.isClosed() && (it.remoteIp == remoteIp || it.remoteNodeId == env.nodeId)
+                        }
+                        if (running && stillMissing) {
+                            connectTcpToIpIfNeeded(remoteIp)
+                        }
+                    }, 900L)
                 }
             }
         }
@@ -390,14 +458,23 @@ class LocalMeshTransport(
     }
 
     private fun connectTcpToIpIfNeeded(targetIp: String) {
-        val myIps = enumerateLocalIpv4Addresses()
+        val (myIps, _) = inspectLocalInterfaces()
         if (myIps.contains(targetIp)) return
         if (clientHandlers.values.any { it.remoteIp == targetIp && !it.isClosed() }) return
         executor.execute {
             try {
                 if (clientHandlers.values.any { it.remoteIp == targetIp && !it.isClosed() }) return@execute
                 val sock = Socket()
-                sock.connect(InetSocketAddress(targetIp, OffGridProtocol.TCP_MESH_PORT), 3000)
+                // Force socket onto local Wi-Fi Network when connecting to non-P2P LAN/Hotspot so 4G data doesn't hijack it
+                if (!targetIp.startsWith("192.168.49.")) {
+                    findLocalWifiNetwork()?.let { wifiNet ->
+                        try {
+                            wifiNet.bindSocket(sock)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+                sock.connect(InetSocketAddress(targetIp, OffGridProtocol.TCP_MESH_PORT), 2800)
                 registerClientSocket(sock, targetIp)
             } catch (_: Throwable) {
             }
@@ -427,9 +504,10 @@ class LocalMeshTransport(
                     val pkt = DatagramPacket(buf, buf.size)
                     sock.receive(pkt)
                     val remoteIp = pkt.address?.hostAddress ?: continue
-                    if (enumerateLocalIpv4Addresses().contains(remoteIp)) continue
+                    val (myIps, _) = inspectLocalInterfaces()
+                    if (myIps.contains(remoteIp)) continue
                     val raw = String(pkt.data, 0, pkt.length, Charsets.UTF_8).trim()
-                    handleIncomingControlJson(raw, remoteIp, sourceKey = null)
+                    onControlJsonReceived(raw, remoteIp, null)
                 }
             } catch (_: Throwable) {
             }
@@ -449,27 +527,16 @@ class LocalMeshTransport(
                 while (running && !sock.isClosed) {
                     val pkt = DatagramPacket(buf, buf.size)
                     sock.receive(pkt)
-                    val remoteIp = pkt.address?.hostAddress
                     val frame = OffGridProtocol.decodeAudioFrame(pkt.data, pkt.length) ?: continue
                     if (frame.senderNodeId == MeshRepository.getSnapshot().localNodeId) continue
                     udpAudioVerifiedNodes.add(frame.senderNodeId)
                     if (frame.type == OffGridProtocol.AUDIO_TYPE_PING) continue
 
-                    // Group Owner relays live voice to all connected clients on the mesh except sender
-                    if (isP2pGroupOwner && remoteIp != null) {
-                        val copy = pkt.data.copyOf(pkt.length)
-                        for ((nodeId, targetIp) in peerUdpTargets) {
-                            if (targetIp != remoteIp && nodeId != frame.senderNodeId) {
-                                val cachedAddr = cachedPeerInetAddrs[nodeId] ?: continue
-                                try {
-                                    sock.send(DatagramPacket(copy, copy.size, cachedAddr, OffGridProtocol.UDP_AUDIO_PORT))
-                                } catch (_: Throwable) {
-                                }
-                            }
-                        }
-                    }
-
-                    onAudioFrameReceived(frame)
+                    val rawCopy = pkt.data.copyOf(pkt.length)
+                    val remoteIp = pkt.address?.hostAddress
+                    val matchingKey = clientHandlers.entries
+                        .firstOrNull { it.value.remoteIp == remoteIp }?.key?.let { "TCP:$it" }
+                    onAudioFrameReceived(frame, rawCopy, matchingKey)
                 }
             } catch (_: Throwable) {
             }
@@ -481,42 +548,78 @@ class LocalMeshTransport(
             var cycle = 0
             while (running) {
                 try {
+                    val now = System.currentTimeMillis()
+                    // 1. Clean up dead half-open TCP connections that missed 4 heartbeats (12s)
+                    for ((key, client) in clientHandlers) {
+                        if (client.isClosed() || now - client.lastRxMs > 12_500L) {
+                            val deadNodeId = client.remoteNodeId
+                            client.closeQuietly(updateUi = true)
+                            if (deadNodeId != null) {
+                                udpAudioVerifiedNodes.remove(deadNodeId)
+                                val hasAnyLeft = clientHandlers.values.any { !it.isClosed() && it.remoteNodeId == deadNodeId }
+                                if (!hasAnyLeft) {
+                                    MeshRepository.clearPeerLinkType(deadNodeId, TransportLinkType.LOCAL_LAN)
+                                    MeshRepository.clearPeerLinkType(deadNodeId, TransportLinkType.WIFI_DIRECT)
+                                }
+                            }
+                        } else {
+                            // Deduplicate redundant dual sockets to the exact same remoteIp
+                            val dup = clientHandlers.values.any { other ->
+                                other !== client && !other.isClosed() && other.remoteIp == client.remoteIp &&
+                                    other.key > key
+                            }
+                            if (dup && client.createdAtMs + 2500L < now) {
+                                client.closeQuietly(updateUi = true)
+                            }
+                        }
+                    }
+
+                    // 2. Retry Wi-Fi Direct TCP connection to Group Owner if interface wasn't ready initially
+                    val ownerIp = currentP2pGroupOwnerIp
+                    if (!isP2pGroupOwner && !ownerIp.isNullOrBlank()) {
+                        val hasOwnerConn = clientHandlers.values.any { !it.isClosed() && it.remoteIp == ownerIp }
+                        if (!hasOwnerConn) {
+                            connectTcpToIpIfNeeded(ownerIp)
+                        }
+                    }
+
+                    // 3. Refresh local interfaces, broadcast Hello, and probe UDP audio path
                     cachedBroadcastAddrs = enumerateBroadcastAddresses()
                     val hello = buildLocalHelloEnvelope()
                     val json = OffGridProtocol.encodeControlJson(hello)
                     broadcastUdpControl(json)
                     for (client in clientHandlers.values) {
-                        client.sendLine(json)
+                        if (!client.isClosed()) client.sendLine(json)
                     }
-                    // Probe UDP 47882 path silently so we know which peers allow direct UDP audio
-                    val pingBytes = OffGridProtocol.encodeAudioFrame(
+
+                    val pingBytes = OffGridProtocol.encodeRelayAudioFrame(
                         type = OffGridProtocol.AUDIO_TYPE_PING,
                         channelNumber = hello.channelNumber,
                         senderNodeId = hello.nodeId,
                         sequence = 0,
+                        ttl = 1,
                         pcmBytes = ByteArray(0)
                     )
                     udpAudioSocket?.let { uSock ->
                         for (addr in cachedPeerInetAddrs.values) {
-                            try {
-                                uSock.send(DatagramPacket(pingBytes, pingBytes.size, addr, OffGridProtocol.UDP_AUDIO_PORT))
-                            } catch (_: Throwable) {
-                            }
+                            sendUdpPacketSafe(uSock, pingBytes, addr, OffGridProtocol.UDP_AUDIO_PORT)
                         }
                     }
+
                     val wifiOn = wifiManager?.isWifiEnabled == true
-                    val lans = enumerateLocalIpv4Addresses()
+                    val (lans, hotspotOn) = inspectLocalInterfaces()
                     MeshRepository.updateSnapshot(forceImmediate = false) {
                         copy(
                             wifiEnabled = wifiOn,
+                            hotspotActive = hotspotOn,
                             localLanIps = lans
                         )
                     }
                     cycle++
-                    if (wifiOn && cycle % 7 == 0 && clientHandlers.isEmpty() && PermissionHelper.hasWifiDirectPermission(context)) {
+                    if (wifiOn && cycle % 6 == 0 && clientHandlers.isEmpty() && PermissionHelper.hasWifiDirectPermission(context)) {
                         discoverPeersAndServices()
                     }
-                    Thread.sleep(3000L)
+                    Thread.sleep(2500L)
                 } catch (_: InterruptedException) {
                     break
                 } catch (_: Throwable) {
@@ -529,82 +632,73 @@ class LocalMeshTransport(
         val sock = udpDiscoverySocket ?: return
         val bytes = json.toByteArray(Charsets.UTF_8)
         for (bcast in enumerateBroadcastAddresses()) {
-            try {
-                sock.send(DatagramPacket(bytes, bytes.size, bcast, OffGridProtocol.UDP_DISCOVERY_PORT))
-            } catch (_: Throwable) {
-            }
+            sendUdpPacketSafe(sock, bytes, bcast, OffGridProtocol.UDP_DISCOVERY_PORT)
         }
         for (ip in peerUdpTargets.values.toSet()) {
             try {
-                sock.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(ip), OffGridProtocol.UDP_DISCOVERY_PORT))
+                val addr = InetAddress.getByName(ip)
+                sendUdpPacketSafe(sock, bytes, addr, OffGridProtocol.UDP_DISCOVERY_PORT)
             } catch (_: Throwable) {
             }
         }
     }
 
-    private fun handleIncomingControlJson(raw: String, remoteIp: String, sourceKey: String?) {
-        val env = OffGridProtocol.decodeControlJson(raw) ?: return
-        val localId = MeshRepository.getSnapshot().localNodeId
-        val viaP2p = remoteIp.startsWith("192.168.49.")
-
-        when (env) {
-            is OffGridProtocol.ControlEnvelope.Hello -> {
-                if (env.nodeId == localId) return
-                rememberPeerUdpTarget(env.nodeId, remoteIp)
-                MeshRepository.upsertPeerFromNetwork(env, remoteIp, viaWifiDirect = viaP2p)
-                if (sourceKey == null && localId > env.nodeId) {
-                    connectTcpToIpIfNeeded(remoteIp)
-                } else if (sourceKey == null && isP2pGroupOwner) {
-                    connectTcpToIpIfNeeded(remoteIp)
-                }
-            }
-            is OffGridProtocol.ControlEnvelope.Chat -> {
-                if (env.senderId == localId) return
-                rememberPeerUdpTarget(env.senderId, remoteIp)
-                val isNew = MeshRepository.appendIncomingMessage(env)
-                if (isNew) {
-                    val ack = OffGridProtocol.ControlEnvelope.ChatAck(msgId = env.msgId, receiverId = localId)
-                    sendControlToAll(ack)
-                    onRemoteChatReceived(env)
-                    relayControlJsonIfGroupOwner(raw, sourceKey)
-                }
-            }
-            is OffGridProtocol.ControlEnvelope.ChatAck -> {
-                if (env.receiverId != localId) {
-                    MeshRepository.markMessageAcked(env.msgId, env.receiverId)
-                    relayControlJsonIfGroupOwner(raw, sourceKey)
-                }
-            }
-            is OffGridProtocol.ControlEnvelope.PttFloor -> {
-                if (env.senderId != localId) {
-                    MeshRepository.updatePeerAudioFloor(env)
-                    relayControlJsonIfGroupOwner(raw, sourceKey)
-                }
-            }
-            is OffGridProtocol.ControlEnvelope.SosSignal -> {
-                if (env.senderId != localId) {
-                    rememberPeerUdpTarget(env.senderId, remoteIp)
-                    MeshRepository.updatePeerSosState(env, remoteIp)
-                    onRemoteSosReceived(env)
-                    relayControlJsonIfGroupOwner(raw, sourceKey)
-                }
-            }
-            is OffGridProtocol.ControlEnvelope.TcpAudio -> {
-                val frame = OffGridProtocol.decodeAudioFrame(env.packetBytes, env.packetBytes.size)
-                if (frame != null && frame.senderNodeId != localId) {
-                    onAudioFrameReceived(frame)
-                    relayControlJsonIfGroupOwner(raw, sourceKey)
+    private fun sendUdpPacketSafe(
+        defaultSocket: DatagramSocket,
+        bytes: ByteArray,
+        target: InetAddress,
+        port: Int
+    ) {
+        try {
+            defaultSocket.send(DatagramPacket(bytes, bytes.size, target, port))
+        } catch (_: Throwable) {
+        }
+        // When mobile 4G is enabled alongside an offline Wi-Fi Hotspot, also transmit via Wi-Fi-bound DatagramSocket
+        val ipStr = target.hostAddress ?: return
+        if (!ipStr.startsWith("192.168.49.")) {
+            val wifiNet = findLocalWifiNetwork()
+            if (wifiNet != null && hasCellularDefaultNetwork()) {
+                var boundSock: DatagramSocket? = null
+                try {
+                    boundSock = DatagramSocket()
+                    wifiNet.bindSocket(boundSock)
+                    boundSock.broadcast = true
+                    boundSock.send(DatagramPacket(bytes, bytes.size, target, port))
+                } catch (_: Throwable) {
+                } finally {
+                    try {
+                        boundSock?.close()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
         }
     }
 
-    private fun relayControlJsonIfGroupOwner(rawJson: String, sourceKey: String?) {
-        if (!isP2pGroupOwner || sourceKey == null) return
-        for ((key, client) in clientHandlers) {
-            if (key != sourceKey) {
-                client.sendLine(rawJson)
+    @Suppress("DEPRECATION")
+    private fun findLocalWifiNetwork(): Network? {
+        val cm = connectivityManager ?: return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        return try {
+            cm.allNetworks.firstOrNull { net ->
+                val caps = cm.getNetworkCapabilities(net)
+                caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
             }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun hasCellularDefaultNetwork(): Boolean {
+        val cm = connectivityManager ?: return false
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false
+        return try {
+            val active = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(active) ?: return false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -613,7 +707,7 @@ class LocalMeshTransport(
             isP2pGroupOwner = false
             currentP2pGroupOwnerIp = null
             MeshRepository.updateSnapshot(forceImmediate = true) {
-                copy(wifiDirectRole = "Siaga", wifiDirectDetail = "P2P terhubung jaringan lokal / siaga")
+                copy(wifiDirectRole = "Siaga", wifiDirectDetail = "Wi-Fi Direct siaga")
             }
             return
         }
@@ -623,19 +717,26 @@ class LocalMeshTransport(
         if (info.isGroupOwner) {
             MeshRepository.updateSnapshot(forceImmediate = true) {
                 copy(
-                    wifiDirectRole = "Host GO (${ownerIp ?: "192.168.49.1"})",
-                    wifiDirectDetail = "Grup aktif: perangkat lain bisa gabung langsung"
+                    wifiDirectRole = "Ketua Rombongan",
+                    wifiDirectDetail = "Rombongan aktif! Teman bisa menekan Cari & Gabung ke HP ini"
                 )
             }
         } else {
             MeshRepository.updateSnapshot(forceImmediate = true) {
                 copy(
-                    wifiDirectRole = "Klien P2P",
-                    wifiDirectDetail = "Terhubung ke Host ${ownerIp ?: "-"}"
+                    wifiDirectRole = "Anggota Rombongan",
+                    wifiDirectDetail = "Tersambung ke rombongan (${ownerIp ?: "-"})"
                 )
             }
             if (!ownerIp.isNullOrBlank()) {
-                connectTcpToIpIfNeeded(ownerIp)
+                val retryDelays = longArrayOf(0L, 600L, 1600L, 3200L)
+                for (delayMs in retryDelays) {
+                    mainHandler.postDelayed({
+                        if (running && currentP2pGroupOwnerIp == ownerIp) {
+                            connectTcpToIpIfNeeded(ownerIp)
+                        }
+                    }, delayMs)
+                }
             }
         }
     }
@@ -787,21 +888,30 @@ class LocalMeshTransport(
         }
     }
 
-    private fun enumerateLocalIpv4Addresses(): List<String> {
+    private fun inspectLocalInterfaces(): Pair<List<String>, Boolean> {
         val ips = mutableListOf<String>()
+        var hotspotOn = false
         try {
-            val ifaces = NetworkInterface.getNetworkInterfaces() ?: return emptyList()
+            val ifaces = NetworkInterface.getNetworkInterfaces() ?: return emptyList<String>() to false
             for (iface in ifaces) {
                 if (!iface.isUp || iface.isLoopback) continue
+                val name = iface.name.lowercase()
                 for (addr in iface.inetAddresses) {
                     if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                        addr.hostAddress?.let { ips.add(it) }
+                        val ip = addr.hostAddress ?: continue
+                        ips.add(ip)
+                        if (name.startsWith("ap") || name.startsWith("swlan") || name.startsWith("softap") ||
+                            name.startsWith("wlan1") || name.startsWith("wlan2") ||
+                            ip.startsWith("192.168.43.") || ip.startsWith("192.168.137.")
+                        ) {
+                            hotspotOn = true
+                        }
                     }
                 }
             }
         } catch (_: Throwable) {
         }
-        return ips.distinct()
+        return ips.distinct() to hotspotOn
     }
 
     private fun enumerateBroadcastAddresses(): List<InetAddress> {
@@ -829,10 +939,16 @@ class LocalMeshTransport(
     }
 
     private inner class ClientConnection(
-        private val key: String,
+        val key: String,
         val remoteIp: String,
         private val socket: Socket
     ) {
+        val createdAtMs: Long = System.currentTimeMillis()
+        @Volatile
+        var lastRxMs: Long = createdAtMs
+        @Volatile
+        var remoteNodeId: String? = null
+
         private val writeLock = Object()
         private val sendQueue = ArrayDeque<String>()
         private val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
@@ -850,7 +966,7 @@ class LocalMeshTransport(
         fun sendLine(jsonLine: String, isAudio: Boolean = false) {
             synchronized(writeLock) {
                 if (isClosed()) return
-                if (isAudio && sendQueue.size >= 10) return
+                if (isAudio && sendQueue.size >= 12) return
                 sendQueue.addLast(jsonLine)
                 writeLock.notifyAll()
             }
@@ -883,8 +999,9 @@ class LocalMeshTransport(
                     val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
                     while (running && !socket.isClosed) {
                         val line = reader.readLine() ?: break
-                        if (line.length <= 32_768) {
-                            handleIncomingControlJson(line, remoteIp, sourceKey = key)
+                        lastRxMs = System.currentTimeMillis()
+                        if (line.length <= 65_536) {
+                            onControlJsonReceived(line, remoteIp, "TCP:$key")
                         }
                     }
                 } catch (_: Throwable) {
@@ -894,7 +1011,7 @@ class LocalMeshTransport(
             }
         }
 
-        fun closeQuietly() {
+        fun closeQuietly(updateUi: Boolean = true) {
             clientHandlers.remove(key)
             synchronized(writeLock) {
                 sendQueue.clear()
@@ -904,7 +1021,9 @@ class LocalMeshTransport(
                 socket.close()
             } catch (_: Throwable) {
             }
-            updateConnectedTcpCount()
+            if (updateUi) {
+                updateConnectedTcpCount()
+            }
         }
     }
 }

@@ -1,16 +1,30 @@
 package com.sanepo.offgrid.model
 
 enum class TransportLinkType(val shortLabel: String) {
-    BLE_BEACON("BLE"),
+    BLE_BEACON("BEACON"),
     BLE_GATT("BT"),
     WIFI_DIRECT("P2P"),
-    LOCAL_LAN("LAN")
+    LOCAL_LAN("LAN"),
+    MESH_RELAY("ESTAFET")
 }
 
 enum class NodeHealthState {
     ONLINE,
     SOS,
     STALE
+}
+
+enum class CompassAccuracyState {
+    GOOD,
+    LOW_NEEDS_CALIBRATION,
+    UNAVAILABLE
+}
+
+enum class RadarRangeMode(val label: String, val fixedMeters: Double?) {
+    AUTO("Otomatis", null),
+    M50("50m", 50.0),
+    M200("200m", 200.0),
+    KM1("1km", 1000.0)
 }
 
 data class PeerNode(
@@ -30,6 +44,11 @@ data class PeerNode(
     val batteryPercent: Int = -1,
     val isSos: Boolean = false,
     val isTransmittingAudio: Boolean = false,
+    val hopCount: Int = 0,
+    val relayViaCallsign: String? = null,
+    val lastPingRttMs: Long? = null,
+    val lastPingHops: Int = 0,
+    val lastPingAtMs: Long = 0L,
     val lastSeenMs: Long = System.currentTimeMillis()
 ) {
     fun healthState(nowMs: Long = System.currentTimeMillis()): NodeHealthState {
@@ -41,6 +60,9 @@ data class PeerNode(
     }
 
     fun hasGpsFix(): Boolean = latitude != null && longitude != null
+
+    fun hasTwoWayLink(): Boolean =
+        linkTypes.any { it != TransportLinkType.BLE_BEACON }
 }
 
 data class WifiDirectDiscoveredPeer(
@@ -63,7 +85,8 @@ data class ChatMessage(
     val isSos: Boolean = false,
     val latitude: Double? = null,
     val longitude: Double? = null,
-    val ackedByNodes: Set<String> = emptySet()
+    val ackedByNodes: Set<String> = emptySet(),
+    val waitingForSignal: Boolean = false
 )
 
 data class MeshStatusSnapshot(
@@ -78,14 +101,18 @@ data class MeshStatusSnapshot(
     val bleStatusDetail: String = "Menunggu inisialisasi BLE",
     val wifiDirectSupported: Boolean = false,
     val wifiEnabled: Boolean = false,
+    val hotspotActive: Boolean = false,
     val wifiDirectRole: String = "Siaga",
     val wifiDirectDetail: String = "Siap pindai perangkat sekitar",
     val wifiDirectPeersCount: Int = 0,
     val localLanIps: List<String> = emptyList(),
     val connectedTcpSockets: Int = 0,
     val bleGattConnectedCount: Int = 0,
+    val relayedPeersCount: Int = 0,
     val activeTalkerId: String? = null,
     val activeTalkerCallsign: String? = null,
+    val crossChannelAlertText: String? = null,
+    val crossChannelAlertNumber: Int? = null,
     val isLocalTransmitting: Boolean = false,
     val isPttLatched: Boolean = false,
     val micLevelNormalized: Float = 0f,
@@ -104,6 +131,7 @@ data class MeshStatusSnapshot(
     val gpsStatusText: String = "Mencari satelit GNSS...",
     val deviceAzimuthDeg: Float = 0f,
     val compassSupported: Boolean = true,
+    val compassAccuracy: CompassAccuracyState = CompassAccuracyState.GOOD,
     val batteryPercent: Int = 100,
     val lastError: String? = null
 )

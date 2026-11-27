@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Sanepo OffGrid Link</string>
-    <string name="app_subtitle">Radio &amp; Radar P2P Tanpa Internet</string>
+    <string name="app_subtitle">Radio &amp; Radar Mesh Tanpa Internet</string>
 
     <string name="tab_radio">Radio PTT</string>
     <string name="tab_radar">Radar</string>
     <string name="tab_chat">Chat</string>
-    <string name="tab_nodes">Jaringan</string>
+    <string name="tab_nodes">Sambungan</string>
 
     <string name="notif_channel_name">Radio &amp; Jaringan OffGrid</string>
     <string name="notif_channel_sos">Peringatan SOS Darurat</string>

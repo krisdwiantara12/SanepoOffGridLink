@@ -98,9 +98,11 @@ object MeshRepository {
     fun getPeersSorted(): List<PeerNode> {
         val now = System.currentTimeMillis()
         return peersMap.values
-            .filter { node -> node.isSos || (now - node.lastSeenMs) < 300_000L }
+            .filter { node -> node.isSos || (now - node.lastSeenMs) < 180_000L }
             .sortedWith(
                 compareByDescending<PeerNode> { it.isSos }
+                    .thenByDescending { it.hasTwoWayLink() }
+                    .thenBy { it.hopCount }
                     .thenByDescending { it.channelNumber == snapshot.channelNumber }
                     .thenByDescending { it.lastSeenMs }
             )
@@ -112,6 +114,38 @@ object MeshRepository {
 
     fun getMessages(): List<ChatMessage> = messagesList.toList()
 
+    fun getKnownMessageIds(limit: Int = 80): List<String> {
+        val msgs = messagesList.toList()
+        if (msgs.size <= limit) return msgs.map { it.msgId }
+        return msgs.takeLast(limit).map { it.msgId }
+    }
+
+    fun getMissingMessagesForPeer(knownIds: Set<String>, maxItems: Int = 10): List<OffGridProtocol.ControlEnvelope.Chat> {
+        val out = ArrayList<OffGridProtocol.ControlEnvelope.Chat>(maxItems)
+        for (msg in messagesList.toList().asReversed()) {
+            if (!knownIds.contains(msg.msgId)) {
+                out.add(
+                    OffGridProtocol.ControlEnvelope.Chat(
+                        msgId = msg.msgId,
+                        senderId = msg.senderId,
+                        senderCallsign = msg.senderCallsign,
+                        channelNumber = msg.channelNumber,
+                        text = msg.text,
+                        timestampMs = msg.timestampMs,
+                        isSos = msg.isSos,
+                        latitude = msg.latitude,
+                        longitude = msg.longitude,
+                        ttl = 2,
+                        hopCount = 0
+                    )
+                )
+                if (out.size >= maxItems) break
+            }
+        }
+        out.reverse()
+        return out
+    }
+
     fun updateIdentity(context: Context, callsign: String, channelNumber: Int) {
         val cleanCallsign = OffGridProtocol.sanitizeCallsign(callsign, maxLen = 12)
         val cleanChannel = OffGridProtocol.clampChannel(channelNumber)
@@ -121,7 +155,12 @@ object MeshRepository {
             .putInt(KEY_CHANNEL, cleanChannel)
             .apply()
         updateSnapshot {
-            copy(localCallsign = cleanCallsign, channelNumber = cleanChannel)
+            copy(
+                localCallsign = cleanCallsign,
+                channelNumber = cleanChannel,
+                crossChannelAlertText = null,
+                crossChannelAlertNumber = null
+            )
         }
     }
 
@@ -129,7 +168,8 @@ object MeshRepository {
         synchronized(this) {
             val updated = snapshot.transform()
             val remoteSos = peersMap.values.filter { it.isSos }
-            snapshot = updated.copy(remoteSosNodes = remoteSos)
+            val relayed = peersMap.values.count { it.hopCount > 0 && it.linkTypes.contains(TransportLinkType.MESH_RELAY) }
+            snapshot = updated.copy(remoteSosNodes = remoteSos, relayedPeersCount = relayed)
         }
         notifyObservers(forceImmediate)
     }
@@ -138,6 +178,34 @@ object MeshRepository {
         synchronized(peersWriteLock) {
             peersMap[nodeId] = updater(peersMap[nodeId])
         }
+    }
+
+    fun clearPeerLinkType(nodeId: String, linkType: TransportLinkType) {
+        synchronized(peersWriteLock) {
+            val existing = peersMap[nodeId] ?: return
+            val updatedLinks = existing.linkTypes - linkType
+            peersMap[nodeId] = existing.copy(
+                linkTypes = updatedLinks,
+                ipAddress = if (linkType == TransportLinkType.WIFI_DIRECT || linkType == TransportLinkType.LOCAL_LAN) null else existing.ipAddress
+            )
+        }
+        notifyObservers(forceImmediate = false)
+    }
+
+    fun clearTransportTypeAcrossPeers(linkType: TransportLinkType) {
+        var changed = false
+        synchronized(peersWriteLock) {
+            for ((nodeId, existing) in peersMap) {
+                if (existing.linkTypes.contains(linkType)) {
+                    peersMap[nodeId] = existing.copy(
+                        linkTypes = existing.linkTypes - linkType,
+                        ipAddress = if (linkType == TransportLinkType.WIFI_DIRECT || linkType == TransportLinkType.LOCAL_LAN) null else existing.ipAddress
+                    )
+                    changed = true
+                }
+            }
+        }
+        if (changed) notifyObservers(forceImmediate = false)
     }
 
     fun upsertPeerFromBle(packet: OffGridProtocol.BleBeaconPacket, rssiDbm: Int) {
@@ -164,6 +232,8 @@ object MeshRepository {
                 longitude = lon,
                 batteryPercent = if (packet.batteryPercent in 0..100) packet.batteryPercent else (existing?.batteryPercent ?: -1),
                 isSos = packet.isSos,
+                hopCount = 0,
+                relayViaCallsign = null,
                 lastSeenMs = now
             )
         }
@@ -179,12 +249,29 @@ object MeshRepository {
     ) {
         if (hello.nodeId == snapshot.localNodeId) return
         val now = System.currentTimeMillis()
+        val isRelayed = hello.hopCount > 0
         val linkType = when {
+            isRelayed -> TransportLinkType.MESH_RELAY
             viaBleGatt -> TransportLinkType.BLE_GATT
             viaWifiDirect -> TransportLinkType.WIFI_DIRECT
             else -> TransportLinkType.LOCAL_LAN
         }
         mutatePeer(hello.nodeId) { existing ->
+            val directExists = existing != null &&
+                (now - existing.lastSeenMs) < 12_000L &&
+                existing.linkTypes.any { it != TransportLinkType.BLE_BEACON && it != TransportLinkType.MESH_RELAY }
+
+            val mergedLinks = if (isRelayed && directExists) {
+                existing!!.linkTypes
+            } else if (!isRelayed) {
+                ((existing?.linkTypes ?: emptySet()) - TransportLinkType.MESH_RELAY) + linkType
+            } else {
+                (existing?.linkTypes ?: emptySet()) + linkType
+            }
+
+            val bestHops = if (!isRelayed) 0 else if (directExists) existing!!.hopCount else hello.hopCount
+            val bestVia = if (!isRelayed || directExists) null else hello.viaCallsign
+
             (existing ?: PeerNode(
                 nodeId = hello.nodeId,
                 callsign = hello.callsign,
@@ -192,19 +279,34 @@ object MeshRepository {
             )).copy(
                 callsign = hello.callsign,
                 channelNumber = hello.channelNumber,
-                linkTypes = (existing?.linkTypes ?: emptySet()) + linkType,
-                ipAddress = remoteIp ?: existing?.ipAddress,
+                linkTypes = mergedLinks,
+                ipAddress = if (!isRelayed && remoteIp != null) remoteIp else existing?.ipAddress,
                 latitude = hello.latitude ?: existing?.latitude,
                 longitude = hello.longitude ?: existing?.longitude,
                 altitudeMeters = hello.altitudeMeters ?: existing?.altitudeMeters,
                 gpsAccuracyMeters = hello.accuracyMeters ?: existing?.gpsAccuracyMeters,
                 batteryPercent = if (hello.batteryPercent in 0..100) hello.batteryPercent else (existing?.batteryPercent ?: -1),
                 isSos = hello.isSos,
+                hopCount = bestHops,
+                relayViaCallsign = bestVia,
                 lastSeenMs = now
             )
         }
         syncRemoteSosIntoSnapshot()
         notifyObservers(forceImmediate = false)
+    }
+
+    fun recordPingResult(peerNodeId: String, rttMs: Long, hops: Int) {
+        synchronized(peersWriteLock) {
+            val existing = peersMap[peerNodeId] ?: return
+            peersMap[peerNodeId] = existing.copy(
+                lastPingRttMs = rttMs.coerceAtLeast(1L),
+                lastPingHops = hops,
+                lastPingAtMs = System.currentTimeMillis(),
+                lastSeenMs = System.currentTimeMillis()
+            )
+        }
+        notifyObservers(forceImmediate = true)
     }
 
     fun updatePeerSosState(sos: OffGridProtocol.ControlEnvelope.SosSignal, remoteIp: String?) {
@@ -236,13 +338,27 @@ object MeshRepository {
             if (existing != null) {
                 peersMap[floor.senderId] = existing.copy(
                     isTransmittingAudio = floor.speaking,
+                    channelNumber = floor.channelNumber,
                     lastSeenMs = System.currentTimeMillis()
                 )
             }
         }
+        val localChannel = snapshot.channelNumber
         updateSnapshot(forceImmediate = true) {
             if (floor.speaking) {
-                copy(activeTalkerId = floor.senderId, activeTalkerCallsign = floor.senderCallsign)
+                if (floor.channelNumber != localChannel && !localSosActive) {
+                    copy(
+                        crossChannelAlertText = "${floor.senderCallsign} berbicara di CH-%02d".format(floor.channelNumber),
+                        crossChannelAlertNumber = floor.channelNumber
+                    )
+                } else {
+                    copy(
+                        activeTalkerId = floor.senderId,
+                        activeTalkerCallsign = floor.senderCallsign,
+                        crossChannelAlertText = null,
+                        crossChannelAlertNumber = null
+                    )
+                }
             } else if (activeTalkerId == floor.senderId) {
                 copy(activeTalkerId = null, activeTalkerCallsign = null, rxLevelNormalized = 0f)
             } else {
@@ -275,14 +391,14 @@ object MeshRepository {
             latitude = chat.latitude,
             longitude = chat.longitude
         )
-        addBoundedMessage(msg)
+        addBoundedMessageSorted(msg)
         notifyObservers(forceImmediate = true)
         return true
     }
 
     fun appendOutgoingMessage(msg: ChatMessage) {
         seenMessageIds.add(msg.msgId)
-        addBoundedMessage(msg)
+        addBoundedMessageSorted(msg)
         notifyObservers(forceImmediate = true)
     }
 
@@ -290,8 +406,11 @@ object MeshRepository {
         var changed = false
         for (i in messagesList.indices) {
             val item = messagesList[i]
-            if (item.msgId == msgId && !item.ackedByNodes.contains(receiverId)) {
-                messagesList[i] = item.copy(ackedByNodes = item.ackedByNodes + receiverId)
+            if (item.msgId == msgId && (!item.ackedByNodes.contains(receiverId) || item.waitingForSignal)) {
+                messagesList[i] = item.copy(
+                    ackedByNodes = item.ackedByNodes + receiverId,
+                    waitingForSignal = false
+                )
                 changed = true
                 break
             }
@@ -299,8 +418,39 @@ object MeshRepository {
         if (changed) notifyObservers(forceImmediate = true)
     }
 
-    private fun addBoundedMessage(msg: ChatMessage) {
+    fun markMessageWaitingSignal(msgId: String) {
+        var changed = false
+        for (i in messagesList.indices) {
+            val item = messagesList[i]
+            if (item.msgId == msgId && item.ackedByNodes.isEmpty() && !item.waitingForSignal) {
+                messagesList[i] = item.copy(waitingForSignal = true)
+                changed = true
+                break
+            }
+        }
+        if (changed) notifyObservers(forceImmediate = true)
+    }
+
+    fun resetMessageRetrying(msgId: String) {
+        var changed = false
+        for (i in messagesList.indices) {
+            val item = messagesList[i]
+            if (item.msgId == msgId && item.waitingForSignal) {
+                messagesList[i] = item.copy(waitingForSignal = false)
+                changed = true
+                break
+            }
+        }
+        if (changed) notifyObservers(forceImmediate = true)
+    }
+
+    private fun addBoundedMessageSorted(msg: ChatMessage) {
         messagesList.add(msg)
+        if (messagesList.size > 1 && messagesList[messagesList.size - 2].timestampMs > msg.timestampMs) {
+            val sorted = messagesList.sortedBy { it.timestampMs }
+            messagesList.clear()
+            messagesList.addAll(sorted)
+        }
         while (messagesList.size > MAX_MESSAGES) {
             messagesList.removeAt(0)
         }
@@ -309,13 +459,14 @@ object MeshRepository {
     private fun syncRemoteSosIntoSnapshot() {
         synchronized(this) {
             val remoteSos = peersMap.values.filter { it.isSos }
-            snapshot = snapshot.copy(remoteSosNodes = remoteSos)
+            val relayed = peersMap.values.count { it.hopCount > 0 && it.linkTypes.contains(TransportLinkType.MESH_RELAY) }
+            snapshot = snapshot.copy(remoteSosNodes = remoteSos, relayedPeersCount = relayed)
         }
     }
 
     private fun notifyObservers(forceImmediate: Boolean) {
         val now = System.currentTimeMillis()
-        if (!forceImmediate && (now - lastNotifyMs) < 160L) {
+        if (!forceImmediate && (now - lastNotifyMs) < 120L) {
             return
         }
         lastNotifyMs = now

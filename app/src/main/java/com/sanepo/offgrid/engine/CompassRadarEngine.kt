@@ -12,8 +12,10 @@ import android.location.LocationManager
 import android.os.Bundle
 import android.os.Looper
 import androidx.core.location.LocationManagerCompat
+import com.sanepo.offgrid.model.CompassAccuracyState
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.sin
 
 class CompassRadarEngine(
@@ -29,7 +31,6 @@ class CompassRadarEngine(
     private val magSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
 
     private val rotationMatrix = FloatArray(9)
-    private val orientationAngles = FloatArray(3)
     private val lastAccel = FloatArray(3)
     private val lastMag = FloatArray(3)
     private var hasAccel = false
@@ -39,6 +40,7 @@ class CompassRadarEngine(
     private var smoothCos = 1.0
     private var lastUiUpdateMs = 0L
     private var running = false
+    private var currentAccuracy = CompassAccuracyState.GOOD
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
@@ -87,8 +89,9 @@ class CompassRadarEngine(
     private fun startCompassSensors() {
         val mgr = sensorManager ?: return
         val supported = rotSensor != null || (accelSensor != null && magSensor != null)
+        currentAccuracy = if (supported) CompassAccuracyState.GOOD else CompassAccuracyState.UNAVAILABLE
         MeshRepository.updateSnapshot(forceImmediate = false) {
-            copy(compassSupported = supported)
+            copy(compassSupported = supported, compassAccuracy = currentAccuracy)
         }
         if (rotSensor != null) {
             mgr.registerListener(this, rotSensor, SensorManager.SENSOR_DELAY_UI)
@@ -104,7 +107,7 @@ class CompassRadarEngine(
         updateGpsAvailabilityText()
         if (!PermissionHelper.hasLocationPermission(context)) {
             MeshRepository.updateSnapshot(forceImmediate = false) {
-                copy(gpsStatusText = "Izin Lokasi belum aktif (Radar memakai jarak sinyal BLE)")
+                copy(gpsStatusText = "Izin Lokasi belum aktif (Radar menunggu GPS)")
             }
             return
         }
@@ -112,7 +115,7 @@ class CompassRadarEngine(
         val gpsEnabled = LocationManagerCompat.isLocationEnabled(mgr)
         if (!gpsEnabled) {
             MeshRepository.updateSnapshot(forceImmediate = false) {
-                copy(gpsEnabled = false, gpsStatusText = "GPS mati: hidupkan Lokasi untuk arah kompas presisi")
+                copy(gpsEnabled = false, gpsStatusText = "GPS HP mati: nyalakan Lokasi untuk arah kompas presisi")
             }
             return
         }
@@ -126,8 +129,8 @@ class CompassRadarEngine(
             if (mgr.allProviders.contains(LocationManager.GPS_PROVIDER)) {
                 mgr.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
-                    2500L,
-                    2.0f,
+                    2000L,
+                    1.5f,
                     locationListener,
                     Looper.getMainLooper()
                 )
@@ -151,7 +154,7 @@ class CompassRadarEngine(
         MeshRepository.updateSnapshot(forceImmediate = false) {
             val status = when {
                 !PermissionHelper.hasLocationPermission(context) ->
-                    "Izin Lokasi belum aktif (mode jarak RSSI)"
+                    "Izin Lokasi belum aktif (hanya baca jarak sinyal)"
                 !enabled ->
                     "GPS perangkat mati"
                 localLatitude != null ->
@@ -164,7 +167,7 @@ class CompassRadarEngine(
     }
 
     private fun publishLocation(loc: Location) {
-        val accText = if (loc.hasAccuracy()) "+/-${loc.accuracy.toInt()}m" else "akurasi standar"
+        val accText = if (loc.hasAccuracy()) "+/-${loc.accuracy.toInt()}m" else "standar"
         MeshRepository.updateSnapshot(forceImmediate = false) {
             copy(
                 gpsEnabled = true,
@@ -180,41 +183,51 @@ class CompassRadarEngine(
 
     override fun onSensorChanged(event: SensorEvent?) {
         event ?: return
-        var rawAzimuthDeg: Double? = null
+        var matrixReady = false
 
         when (event.sensor.type) {
             Sensor.TYPE_ROTATION_VECTOR -> {
                 SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-                SensorManager.getOrientation(rotationMatrix, orientationAngles)
-                rawAzimuthDeg = GeoMath.normalizeAzimuth(Math.toDegrees(orientationAngles[0].toDouble()))
+                matrixReady = true
             }
             Sensor.TYPE_ACCELEROMETER -> {
                 System.arraycopy(event.values, 0, lastAccel, 0, minOf(3, event.values.size))
                 hasAccel = true
-                if (hasMag && SensorManager.getRotationMatrix(rotationMatrix, null, lastAccel, lastMag)) {
-                    SensorManager.getOrientation(rotationMatrix, orientationAngles)
-                    rawAzimuthDeg = GeoMath.normalizeAzimuth(Math.toDegrees(orientationAngles[0].toDouble()))
+                if (hasMag) {
+                    matrixReady = SensorManager.getRotationMatrix(rotationMatrix, null, lastAccel, lastMag)
                 }
             }
             Sensor.TYPE_MAGNETIC_FIELD -> {
                 System.arraycopy(event.values, 0, lastMag, 0, minOf(3, event.values.size))
                 hasMag = true
-                if (hasAccel && SensorManager.getRotationMatrix(rotationMatrix, null, lastAccel, lastMag)) {
-                    SensorManager.getOrientation(rotationMatrix, orientationAngles)
-                    rawAzimuthDeg = GeoMath.normalizeAzimuth(Math.toDegrees(orientationAngles[0].toDouble()))
+                if (hasAccel) {
+                    matrixReady = SensorManager.getRotationMatrix(rotationMatrix, null, lastAccel, lastMag)
                 }
             }
         }
 
-        val az = rawAzimuthDeg ?: return
-        val rad = Math.toRadians(az)
-        val alpha = 0.22
+        if (!matrixReady) return
+
+        // Tilt-compensated heading: use top edge (R[1], R[4]) when horizontal/angled, or back camera (-R[2], -R[5]) when upright
+        val yEast = rotationMatrix[1].toDouble()
+        val yNorth = rotationMatrix[4].toDouble()
+        val yMag = hypot(yEast, yNorth)
+        val rawAzimuthDeg = if (yMag >= 0.40) {
+            GeoMath.normalizeAzimuth(Math.toDegrees(atan2(yEast, yNorth)))
+        } else {
+            val zBackEast = -rotationMatrix[2].toDouble()
+            val zBackNorth = -rotationMatrix[5].toDouble()
+            GeoMath.normalizeAzimuth(Math.toDegrees(atan2(zBackEast, zBackNorth)))
+        }
+
+        val rad = Math.toRadians(rawAzimuthDeg)
+        val alpha = 0.24
         smoothSin = smoothSin * (1.0 - alpha) + sin(rad) * alpha
         smoothCos = smoothCos * (1.0 - alpha) + cos(rad) * alpha
         val smoothedDeg = GeoMath.normalizeAzimuth(Math.toDegrees(atan2(smoothSin, smoothCos))).toFloat()
 
         val now = System.currentTimeMillis()
-        if (now - lastUiUpdateMs >= 75L) {
+        if (now - lastUiUpdateMs >= 65L) {
             lastUiUpdateMs = now
             MeshRepository.updateSnapshot(forceImmediate = true) {
                 copy(deviceAzimuthDeg = smoothedDeg)
@@ -223,5 +236,18 @@ class CompassRadarEngine(
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        if (sensor == null) return
+        if (sensor.type != Sensor.TYPE_MAGNETIC_FIELD && sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
+        val nextState = when (accuracy) {
+            SensorManager.SENSOR_STATUS_UNRELIABLE,
+            SensorManager.SENSOR_STATUS_ACCURACY_LOW -> CompassAccuracyState.LOW_NEEDS_CALIBRATION
+            else -> CompassAccuracyState.GOOD
+        }
+        if (nextState != currentAccuracy) {
+            currentAccuracy = nextState
+            MeshRepository.updateSnapshot(forceImmediate = false) {
+                copy(compassAccuracy = nextState)
+            }
+        }
     }
 }
