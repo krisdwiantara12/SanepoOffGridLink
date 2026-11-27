@@ -460,6 +460,18 @@
                             android:textSize="18sp"
                             android:textStyle="bold" />
                     </LinearLayout>
+
+                    <Button
+                        android:id="@+id/btnTestAudio"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:background="@drawable/bg_keycap_btn"
+                        android:minHeight="48dp"
+                        android:text="Tes Mic &amp; Speaker Lokal (2 Detik)"
+                        android:textColor="@color/ink_primary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
                 </LinearLayout>
 
                 <!-- Tactical Hold-2-Sec SOS Trigger -->
@@ -785,7 +797,7 @@
                     android:layout_marginTop="10dp"
                     android:background="@drawable/bg_well_live"
                     android:padding="12dp"
-                    android:text="Cara sambung 100% offline: (1) Tanpa Wi-Fi sama sekali: nyalakan Bluetooth &amp; Lokasi di kedua HP untuk koneksi BLE GATT otomatis (chat, radar, SOS, suara PTT 8kHz). (2) Untuk suara HD jarak jauh: nyalakan Wi-Fi lalu tekan Buat Host P2P / gabung Hotspot tanpa kuota."
+                    android:text="Pilihan Koneksi Tanpa Kuota:\n1. Mode Bluetooth (Tanpa Wi-Fi): Wajib nyalakan Bluetooth + Lokasi HP di kedua HP (aturan Android OS untuk scan sekitar).\n2. Mode Hotspot Offline (Tanpa Bluetooth/Lokasi): Nyalakan Hotspot dari 1 HP tanpa kuota/SIM lalu HP lain gabung Wi-Fi ke Hotspot itu -> chat &amp; suara langsung lancar."
                     android:textColor="@color/ink_primary"
                     android:textSize="12sp" />
 

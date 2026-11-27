@@ -29,6 +29,8 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.ArrayDeque
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -58,6 +60,7 @@ class LocalMeshTransport(
     private val clientHandlers = ConcurrentHashMap<String, ClientConnection>()
     private val peerUdpTargets = ConcurrentHashMap<String, String>() // nodeId -> ipAddress
     private val cachedPeerInetAddrs = ConcurrentHashMap<String, InetAddress>()
+    private val udpAudioVerifiedNodes: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap())
     @Volatile
     private var cachedBroadcastAddrs: List<InetAddress> = emptyList()
     private val txtMetadataByMac = ConcurrentHashMap<String, Map<String, String>>()
@@ -329,24 +332,33 @@ class LocalMeshTransport(
         }
     }
 
-    fun hasNetworkPeers(): Boolean = clientHandlers.isNotEmpty() || peerUdpTargets.isNotEmpty()
+    fun hasNetworkPeers(): Boolean = clientHandlers.isNotEmpty() || udpAudioVerifiedNodes.isNotEmpty()
 
     fun sendAudioFrameToPeers(packetBytes: ByteArray) {
         audioTxExecutor.execute {
-            val socket = udpAudioSocket ?: return@execute
+            val socket = udpAudioSocket
             val targetAddrs = cachedPeerInetAddrs.values
-            for (addr in targetAddrs) {
-                try {
-                    socket.send(DatagramPacket(packetBytes, packetBytes.size, addr, OffGridProtocol.UDP_AUDIO_PORT))
-                } catch (_: Throwable) {
-                }
-            }
-            if (targetAddrs.isEmpty()) {
-                for (bcast in cachedBroadcastAddrs) {
+            if (socket != null) {
+                for (addr in targetAddrs) {
                     try {
-                        socket.send(DatagramPacket(packetBytes, packetBytes.size, bcast, OffGridProtocol.UDP_AUDIO_PORT))
+                        socket.send(DatagramPacket(packetBytes, packetBytes.size, addr, OffGridProtocol.UDP_AUDIO_PORT))
                     } catch (_: Throwable) {
                     }
+                }
+                if (targetAddrs.isEmpty()) {
+                    for (bcast in cachedBroadcastAddrs) {
+                        try {
+                            socket.send(DatagramPacket(packetBytes, packetBytes.size, bcast, OffGridProtocol.UDP_AUDIO_PORT))
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+            // Hybrid TCP fallback: if any connected TCP client hasn't proved UDP path, mirror via TCP noDelay
+            if (clientHandlers.isNotEmpty() && udpAudioVerifiedNodes.size < clientHandlers.size) {
+                val tcpJson = OffGridProtocol.encodeControlJson(OffGridProtocol.ControlEnvelope.TcpAudio(packetBytes))
+                for (client in clientHandlers.values) {
+                    client.sendLine(tcpJson, isAudio = true)
                 }
             }
         }
@@ -440,6 +452,8 @@ class LocalMeshTransport(
                     val remoteIp = pkt.address?.hostAddress
                     val frame = OffGridProtocol.decodeAudioFrame(pkt.data, pkt.length) ?: continue
                     if (frame.senderNodeId == MeshRepository.getSnapshot().localNodeId) continue
+                    udpAudioVerifiedNodes.add(frame.senderNodeId)
+                    if (frame.type == OffGridProtocol.AUDIO_TYPE_PING) continue
 
                     // Group Owner relays live voice to all connected clients on the mesh except sender
                     if (isP2pGroupOwner && remoteIp != null) {
@@ -473,6 +487,22 @@ class LocalMeshTransport(
                     broadcastUdpControl(json)
                     for (client in clientHandlers.values) {
                         client.sendLine(json)
+                    }
+                    // Probe UDP 47882 path silently so we know which peers allow direct UDP audio
+                    val pingBytes = OffGridProtocol.encodeAudioFrame(
+                        type = OffGridProtocol.AUDIO_TYPE_PING,
+                        channelNumber = hello.channelNumber,
+                        senderNodeId = hello.nodeId,
+                        sequence = 0,
+                        pcmBytes = ByteArray(0)
+                    )
+                    udpAudioSocket?.let { uSock ->
+                        for (addr in cachedPeerInetAddrs.values) {
+                            try {
+                                uSock.send(DatagramPacket(pingBytes, pingBytes.size, addr, OffGridProtocol.UDP_AUDIO_PORT))
+                            } catch (_: Throwable) {
+                            }
+                        }
                     }
                     val wifiOn = wifiManager?.isWifiEnabled == true
                     val lans = enumerateLocalIpv4Addresses()
@@ -556,6 +586,13 @@ class LocalMeshTransport(
                     rememberPeerUdpTarget(env.senderId, remoteIp)
                     MeshRepository.updatePeerSosState(env, remoteIp)
                     onRemoteSosReceived(env)
+                    relayControlJsonIfGroupOwner(raw, sourceKey)
+                }
+            }
+            is OffGridProtocol.ControlEnvelope.TcpAudio -> {
+                val frame = OffGridProtocol.decodeAudioFrame(env.packetBytes, env.packetBytes.size)
+                if (frame != null && frame.senderNodeId != localId) {
+                    onAudioFrameReceived(frame)
                     relayControlJsonIfGroupOwner(raw, sourceKey)
                 }
             }
@@ -796,22 +833,47 @@ class LocalMeshTransport(
         val remoteIp: String,
         private val socket: Socket
     ) {
-        private val writeLock = Any()
+        private val writeLock = Object()
+        private val sendQueue = ArrayDeque<String>()
         private val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
+
+        init {
+            try {
+                socket.tcpNoDelay = true
+            } catch (_: Throwable) {
+            }
+            executor.execute { writeLoop() }
+        }
 
         fun isClosed(): Boolean = socket.isClosed || !socket.isConnected
 
-        fun sendLine(jsonLine: String) {
-            executor.execute {
-                synchronized(writeLock) {
-                    try {
-                        writer.write(jsonLine)
-                        writer.newLine()
-                        writer.flush()
-                    } catch (_: Throwable) {
-                        closeQuietly()
+        fun sendLine(jsonLine: String, isAudio: Boolean = false) {
+            synchronized(writeLock) {
+                if (isClosed()) return
+                if (isAudio && sendQueue.size >= 10) return
+                sendQueue.addLast(jsonLine)
+                writeLock.notifyAll()
+            }
+        }
+
+        private fun writeLoop() {
+            try {
+                while (running && !isClosed()) {
+                    var line: String?
+                    synchronized(writeLock) {
+                        while (running && !isClosed() && sendQueue.isEmpty()) {
+                            writeLock.wait(1000L)
+                        }
+                        line = if (sendQueue.isNotEmpty()) sendQueue.removeFirst() else null
                     }
+                    val toWrite = line ?: continue
+                    writer.write(toWrite)
+                    writer.newLine()
+                    writer.flush()
                 }
+            } catch (_: Throwable) {
+            } finally {
+                closeQuietly()
             }
         }
 
@@ -834,6 +896,10 @@ class LocalMeshTransport(
 
         fun closeQuietly() {
             clientHandlers.remove(key)
+            synchronized(writeLock) {
+                sendQueue.clear()
+                writeLock.notifyAll()
+            }
             try {
                 socket.close()
             } catch (_: Throwable) {

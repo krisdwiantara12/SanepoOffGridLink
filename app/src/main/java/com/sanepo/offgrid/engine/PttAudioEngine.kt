@@ -8,14 +8,12 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.NoiseSuppressor
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.ArrayDeque
 import java.util.TreeMap
 import kotlin.math.PI
 import kotlin.math.abs
@@ -32,7 +30,7 @@ class PttAudioEngine(
 ) {
     companion object {
         const val SAMPLE_RATE_HZ = 16_000
-        const val FRAME_SAMPLES = 640 // 40 ms @ 16 kHz (25 packets/sec for rock-solid jitter stability)
+        const val FRAME_SAMPLES = 640 // 40 ms @ 16 kHz
         const val FRAME_BYTES = FRAME_SAMPLES * 2 // 1280 bytes raw PCM per 40 ms
 
         fun computeNormalizedRms(pcmBytes: ByteArray, length: Int = pcmBytes.size): Float {
@@ -48,7 +46,20 @@ class PttAudioEngine(
                 i += 2
             }
             val rms = sqrt(sumSq / samples)
-            return (rms / 8500.0).toFloat().coerceIn(0f, 1f)
+            return (rms / 7500.0).toFloat().coerceIn(0f, 1f)
+        }
+
+        fun applySoftGainInPlace(pcmBytes: ByteArray, length: Int, gainPercent: Int = 165) {
+            var i = 0
+            while (i + 1 < length) {
+                val lo = pcmBytes[i].toInt() and 0xFF
+                val hi = pcmBytes[i + 1].toInt()
+                val sample = ((hi shl 8) or lo).toShort().toInt()
+                val boosted = ((sample * gainPercent) / 100).coerceIn(-32767, 32767)
+                pcmBytes[i] = (boosted and 0xFF).toByte()
+                pcmBytes[i + 1] = (boosted ushr 8).toByte()
+                i += 2
+            }
         }
 
         fun synthesizeRogerBeepPcm(): ByteArray {
@@ -97,6 +108,8 @@ class PttAudioEngine(
 
     private val rxLock = Object()
     private val jitterBuffer = TreeMap<Int, QueuedPcmFrame>()
+    private val dedupOrder = ArrayDeque<String>()
+    private val dedupSet = HashSet<String>()
     private var expectedNextSeq: Int? = null
     private var burstStartWaitMs: Long = 0L
     private var prebuffering = true
@@ -111,10 +124,19 @@ class PttAudioEngine(
     private var transmitting = false
 
     @Volatile
+    private var selfTestRunning = false
+
+    @Volatile
     private var recordingThread: Thread? = null
 
     @Volatile
     private var txSequence = 0
+
+    @Volatile
+    private var txPacketCounter = 0L
+
+    @Volatile
+    private var rxPacketCounter = 0L
 
     private val rogerBeepBytes: ByteArray by lazy { synthesizeRogerBeepPcm() }
 
@@ -173,7 +195,6 @@ class PttAudioEngine(
                             val firstKey = jitterBuffer.firstKey()
                             val exp = expectedNextSeq
                             if (exp != null && firstKey > exp && jitterBuffer.size < 3) {
-                                // Small 15ms wait for one slightly delayed out-of-order UDP packet before skipping gap
                                 try {
                                     rxLock.wait(15L)
                                 } catch (_: InterruptedException) {
@@ -190,7 +211,7 @@ class PttAudioEngine(
                 }
 
                 val item = frameToPlay ?: continue
-                if (transmitting) continue
+                if (transmitting || selfTestRunning) continue
 
                 val track = ensureAudioTrack() ?: continue
                 try {
@@ -204,15 +225,18 @@ class PttAudioEngine(
                         }
                     } else if (item.pcmBytes.isNotEmpty()) {
                         track.write(item.pcmBytes, 0, item.pcmBytes.size)
+                        rxPacketCounter++
                         val now = System.currentTimeMillis()
-                        if (now - lastRxUiNotifyMs >= 90L) {
+                        if (now - lastRxUiNotifyMs >= 90L || rxPacketCounter <= 2L) {
                             lastRxUiNotifyMs = now
                             val level = computeNormalizedRms(item.pcmBytes)
+                            val countSnap = rxPacketCounter
                             MeshRepository.updateSnapshot(forceImmediate = false) {
                                 copy(
                                     activeTalkerId = item.senderId,
                                     activeTalkerCallsign = item.senderName,
-                                    rxLevelNormalized = level
+                                    rxLevelNormalized = level,
+                                    rxAudioPackets = countSnap
                                 )
                             }
                         }
@@ -227,10 +251,13 @@ class PttAudioEngine(
 
     fun stopAll() {
         stopTransmitting(sendRoger = false)
+        selfTestRunning = false
         mainHandler.removeCallbacks(rxTimeoutRunnable)
         playbackRunning = false
         synchronized(rxLock) {
             jitterBuffer.clear()
+            dedupOrder.clear()
+            dedupSet.clear()
             rxLock.notifyAll()
         }
         playbackThread?.interrupt()
@@ -247,8 +274,109 @@ class PttAudioEngine(
     fun isTransmitting(): Boolean = transmitting
 
     @SuppressLint("MissingPermission")
+    fun runLocalAudioSelfTest(onDone: (peakPercent: Int, message: String) -> Unit) {
+        if (transmitting || selfTestRunning) return
+        if (!PermissionHelper.hasAudioPermission(context)) {
+            onDone(0, "Izin mikrofon belum diberikan.")
+            return
+        }
+        selfTestRunning = true
+        MeshRepository.updateSnapshot(forceImmediate = true) {
+            copy(isAudioSelfTestRunning = true, lastError = null)
+        }
+        Thread({
+            var recorder: AudioRecord? = null
+            try {
+                val minBuf = AudioRecord.getMinBufferSize(
+                    SAMPLE_RATE_HZ,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                )
+                if (minBuf <= 0) {
+                    mainHandler.post { onDone(0, "Hardware mic tidak mendukung 16kHz PCM.") }
+                    return@Thread
+                }
+                recorder = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    SAMPLE_RATE_HZ,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    maxOf(minBuf * 2, FRAME_BYTES * 4)
+                )
+                if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                    mainHandler.post { onDone(0, "Gagal membuka mikrofon.") }
+                    return@Thread
+                }
+
+                playImmediateCue(rogerBeepBytes)
+                val frames = mutableListOf<ByteArray>()
+                val buf = ByteArray(FRAME_BYTES)
+                var peakRms = 0f
+                val state = ImaAdpcmCodec.EncoderState()
+
+                recorder.startRecording()
+                val startMs = System.currentTimeMillis()
+                while (selfTestRunning && System.currentTimeMillis() - startMs < 1600L) {
+                    var offset = 0
+                    while (offset < FRAME_BYTES && selfTestRunning) {
+                        val n = recorder.read(buf, offset, FRAME_BYTES - offset)
+                        if (n > 0) offset += n else break
+                    }
+                    if (offset > 0) {
+                        applySoftGainInPlace(buf, offset)
+                        val rms = computeNormalizedRms(buf, offset)
+                        if (rms > peakRms) peakRms = rms
+                        frames.add(ImaAdpcmCodec.encodePcm16Le(buf, offset, state))
+                        MeshRepository.updateSnapshot(forceImmediate = true) {
+                            copy(micLevelNormalized = rms)
+                        }
+                    }
+                }
+                try {
+                    recorder.stop()
+                } catch (_: Throwable) {
+                }
+
+                val track = ensureAudioTrack()
+                if (track != null) {
+                    if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+                    for (encoded in frames) {
+                        val decoded = ImaAdpcmCodec.decodeToPcm16Le(encoded)
+                        val rxLvl = computeNormalizedRms(decoded)
+                        MeshRepository.updateSnapshot(forceImmediate = true) {
+                            copy(micLevelNormalized = 0f, rxLevelNormalized = rxLvl)
+                        }
+                        track.write(decoded, 0, decoded.size)
+                    }
+                    track.write(rogerBeepBytes, 0, rogerBeepBytes.size)
+                }
+
+                val pct = (peakRms * 100f).toInt().coerceIn(0, 100)
+                val msg = if (pct < 2) {
+                    "Mic merekam senyap ($pct%): coba bicara lebih dekat ke mic bawah HP."
+                } else {
+                    "Tes Mic & Speaker OK (level puncak $pct%)."
+                }
+                mainHandler.post { onDone(pct, msg) }
+            } catch (t: Throwable) {
+                mainHandler.post { onDone(0, "Tes audio gagal: ${t.message ?: "error"}") }
+            } finally {
+                try {
+                    recorder?.release()
+                } catch (_: Throwable) {
+                }
+                selfTestRunning = false
+                MeshRepository.updateSnapshot(forceImmediate = true) {
+                    copy(isAudioSelfTestRunning = false, micLevelNormalized = 0f, rxLevelNormalized = 0f)
+                }
+            }
+        }, "SanepoAudioSelfTest").start()
+    }
+
+    @SuppressLint("MissingPermission")
     fun startTransmitting(): Boolean {
         if (transmitting) return true
+        selfTestRunning = false
         if (!PermissionHelper.hasAudioPermission(context)) {
             MeshRepository.updateSnapshot(forceImmediate = true) {
                 copy(lastError = "Izin mikrofon dibutuhkan untuk Walkie-Talkie PTT")
@@ -269,14 +397,10 @@ class PttAudioEngine(
         }
 
         val recBufSize = maxOf(minBuf * 3, FRAME_BYTES * 6)
+        // Always use raw AudioSource.MIC (never VOICE_COMMUNICATION which triggers OEM VoIP HAL muting)
         val recorder = try {
-            val source = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION
-            } else {
-                MediaRecorder.AudioSource.MIC
-            }
             AudioRecord(
-                source,
+                MediaRecorder.AudioSource.MIC,
                 SAMPLE_RATE_HZ,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -297,27 +421,20 @@ class PttAudioEngine(
             return false
         }
 
-        val aec = if (AcousticEchoCanceler.isAvailable()) {
-            try {
-                AcousticEchoCanceler.create(recorder.audioSessionId)?.apply { enabled = true }
-            } catch (_: Throwable) {
-                null
-            }
-        } else null
-
-        val ns = if (NoiseSuppressor.isAvailable()) {
-            try {
-                NoiseSuppressor.create(recorder.audioSessionId)?.apply { enabled = true }
-            } catch (_: Throwable) {
-                null
-            }
-        } else null
-
         transmitting = true
         playImmediateCue(rogerBeepBytes)
         onSendPttFloor(true)
+
+        val ipReady = hasIpTransportPeers()
+        val btReady = hasBleGattPeers()
+        val routeLabel = when {
+            ipReady -> "Wi-Fi HD"
+            btReady -> "Bluetooth LE"
+            else -> "Siaran Lokal"
+        }
+
         MeshRepository.updateSnapshot(forceImmediate = true) {
-            copy(isLocalTransmitting = true, lastError = null)
+            copy(isLocalTransmitting = true, activeAudioTransport = routeLabel, lastError = null)
         }
 
         val thread = Thread({
@@ -344,10 +461,10 @@ class PttAudioEngine(
                     }
                     if (!transmitting || offset <= 0) break
 
+                    applySoftGainInPlace(frameBuf, offset)
                     val snap = MeshRepository.getSnapshot()
                     val seq = ++txSequence
 
-                    // Compact 4:1 ADPCM @ 16kHz (~8 KB/s) over Wi-Fi Direct / LAN UDP
                     val adpcm16 = ImaAdpcmCodec.encodePcm16Le(frameBuf, offset, adpcmState16)
                     val wifiPkt = OffGridProtocol.encodeAudioFrame(
                         type = OffGridProtocol.AUDIO_TYPE_ADPCM_16K,
@@ -358,7 +475,6 @@ class PttAudioEngine(
                     )
                     onSendIpAudioFrame(wifiPkt)
 
-                    // Fallback 8kHz ADPCM (~4 KB/s) over Bluetooth LE GATT when no Wi-Fi IP peer is active
                     if (!hasIpTransportPeers() && hasBleGattPeers()) {
                         val pcm8k = ImaAdpcmCodec.downsample16kTo8k(frameBuf, offset)
                         val adpcm8 = ImaAdpcmCodec.encodePcm16Le(pcm8k, pcm8k.size, adpcmState8)
@@ -372,25 +488,19 @@ class PttAudioEngine(
                         onSendBleAudioFrame(blePkt)
                     }
 
+                    txPacketCounter++
                     val now = System.currentTimeMillis()
-                    if (now - lastMeterUiMs >= 80L) {
+                    if (now - lastMeterUiMs >= 80L || txPacketCounter <= 2L) {
                         lastMeterUiMs = now
                         val level = computeNormalizedRms(frameBuf, offset)
+                        val txSnap = txPacketCounter
                         MeshRepository.updateSnapshot(forceImmediate = true) {
-                            copy(micLevelNormalized = level)
+                            copy(micLevelNormalized = level, txAudioPackets = txSnap)
                         }
                     }
                 }
             } catch (_: Throwable) {
             } finally {
-                try {
-                    aec?.release()
-                } catch (_: Throwable) {
-                }
-                try {
-                    ns?.release()
-                } catch (_: Throwable) {
-                }
                 try {
                     recorder.stop()
                 } catch (_: Throwable) {
@@ -434,10 +544,22 @@ class PttAudioEngine(
     }
 
     fun onIncomingAudioFrame(frame: OffGridProtocol.AudioFramePacket) {
+        if (frame.type == OffGridProtocol.AUDIO_TYPE_PING) return
         val snap = MeshRepository.getSnapshot()
         if (frame.senderNodeId == snap.localNodeId) return
         if (frame.channelNumber != snap.channelNumber && !snap.localSosActive) return
-        if (transmitting) return
+        if (transmitting || selfTestRunning) return
+
+        val dedupKey = "${frame.senderNodeId}:${frame.type}:${frame.sequence}"
+        synchronized(rxLock) {
+            if (dedupSet.contains(dedupKey)) return
+            dedupSet.add(dedupKey)
+            dedupOrder.addLast(dedupKey)
+            while (dedupOrder.size > 48) {
+                val oldest = dedupOrder.removeFirst()
+                dedupSet.remove(oldest)
+            }
+        }
 
         lastRxPacketMs = System.currentTimeMillis()
         mainHandler.removeCallbacks(rxTimeoutRunnable)
@@ -497,6 +619,7 @@ class PttAudioEngine(
         return try {
             try {
                 audioManager?.mode = AudioManager.MODE_NORMAL
+                audioManager?.isSpeakerphoneOn = true
             } catch (_: Throwable) {
             }
             val minOut = AudioTrack.getMinBufferSize(

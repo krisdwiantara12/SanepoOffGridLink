@@ -99,6 +99,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     private lateinit var tvPttDomeLabel: TextView
     private lateinit var btnPttLatch: View
     private lateinit var tvLatchLabel: TextView
+    private lateinit var btnTestAudio: Button
     private lateinit var btnSosHold: View
     private lateinit var tvSosBtnLabel: TextView
     private lateinit var progressSosHold: android.widget.ProgressBar
@@ -267,10 +268,14 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         val sameChannelCount = peers.count { it.channelNumber == snapshot.channelNumber }
         tvRadioPeerCountBadge.text = "$sameChannelCount di CH-%02d (${peers.size} total)".format(snapshot.channelNumber)
 
-        val rxActive = snapshot.activeTalkerCallsign != null && !snapshot.isLocalTransmitting
+        val rxActive = (snapshot.activeTalkerCallsign != null || snapshot.isAudioSelfTestRunning) && !snapshot.isLocalTransmitting
         waveformMeter.updateAudioState(
-            levelNormalized = if (snapshot.isLocalTransmitting) snapshot.micLevelNormalized else snapshot.rxLevelNormalized,
-            txActive = snapshot.isLocalTransmitting,
+            levelNormalized = if (snapshot.isLocalTransmitting || snapshot.micLevelNormalized > snapshot.rxLevelNormalized) {
+                snapshot.micLevelNormalized
+            } else {
+                snapshot.rxLevelNormalized
+            },
+            txActive = snapshot.isLocalTransmitting || snapshot.isAudioSelfTestRunning,
             rxActive = rxActive
         )
 
@@ -287,11 +292,21 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             else -> "TAHAN BICARA"
         }
 
+        val speakerMuted = offGridService?.isSpeakerMuted() == true
         tvRadioFloorState.text = when {
-            snapshot.isLocalTransmitting -> "MEMANCAR SUARA ke CH-%02d (Roger Beep aktif)".format(snapshot.channelNumber)
-            snapshot.activeTalkerCallsign != null -> "MENERIMA SUARA DARI: ${snapshot.activeTalkerCallsign}"
+            snapshot.isAudioSelfTestRunning -> "TES MIC & SPEAKER: Silakan bicara dekat HP..."
+            snapshot.isLocalTransmitting -> "MEMANCAR [${snapshot.activeAudioTransport}] · Paket TX: ${snapshot.txAudioPackets}"
+            snapshot.activeTalkerCallsign != null -> "MENERIMA DARI ${snapshot.activeTalkerCallsign} · Paket RX: ${snapshot.rxAudioPackets}"
+            speakerMuted -> "PERHATIAN: Volume Media HP 0%! Naikkan volume agar suara terdengar."
             snapshot.lastError != null -> snapshot.lastError
-            else -> "SIAGA DENGAR : Tahan PTT atau tekan Kunci Mic untuk berbicara"
+            else -> "SIAGA DENGAR : TX ${snapshot.txAudioPackets} | RX ${snapshot.rxAudioPackets} paket"
+        }
+
+        btnTestAudio.isEnabled = !snapshot.isAudioSelfTestRunning && !snapshot.isLocalTransmitting
+        btnTestAudio.text = if (snapshot.isAudioSelfTestRunning) {
+            "Menguji Mic & Speaker..."
+        } else {
+            "Tes Mic & Speaker Lokal (2 Detik)"
         }
 
         val btLinkText = when {
@@ -301,7 +316,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             else -> "Mati"
         }
         val lanTag = snapshot.localLanIps.firstOrNull() ?: "-"
-        tvRadioTransportSummary.text = "$btLinkText | P2P: ${snapshot.wifiDirectRole} | IP: $lanTag"
+        tvRadioTransportSummary.text = "$btLinkText | P2P: ${snapshot.wifiDirectRole} | TCP: ${snapshot.connectedTcpSockets} | IP: $lanTag"
         updateHardwareBanner(snapshot)
 
         tvLatchLabel.text = if (snapshot.isPttLatched) "Kunci Mic: AKTIF" else "Kunci Mic: MATI"
@@ -413,6 +428,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         tvPttDomeLabel = findViewById(R.id.tvPttDomeLabel)
         btnPttLatch = findViewById(R.id.btnPttLatch)
         tvLatchLabel = findViewById(R.id.tvLatchLabel)
+        btnTestAudio = findViewById(R.id.btnTestAudio)
         btnSosHold = findViewById(R.id.btnSosHold)
         tvSosBtnLabel = findViewById(R.id.tvSosBtnLabel)
         progressSosHold = findViewById(R.id.progressSosHold)
@@ -531,6 +547,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         btnPttDome.setOnTouchListener { v, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
                     v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     if (!PermissionHelper.hasAudioPermission(this)) {
                         requestMissingPermissionsIfNeeded(initialLaunch = false)
@@ -540,6 +557,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.parent?.requestDisallowInterceptTouchEvent(false)
                     if (!MeshRepository.getSnapshot().isPttLatched) {
                         offGridService?.stopPttTransmit(sendRoger = true)
                     }
@@ -583,6 +601,16 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             val cur = MeshRepository.getSnapshot().channelNumber
             val next = if (cur >= 20) 1 else cur + 1
             offGridService?.updateIdentityAndBroadcast(MeshRepository.getSnapshot().localCallsign, next)
+        }
+
+        btnTestAudio.setOnClickListener {
+            if (!PermissionHelper.hasAudioPermission(this)) {
+                requestMissingPermissionsIfNeeded(initialLaunch = false)
+                return@setOnClickListener
+            }
+            offGridService?.runLocalAudioSelfTest { _, msg ->
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
         }
 
         // Hold 2 sec SOS button (prevent accidental tap)
@@ -803,7 +831,10 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     }
 
     private fun updateHardwareBanner(snapshot: MeshStatusSnapshot) {
-        if (bannerPermission.visibility == View.VISIBLE) {
+        val alreadyLinked = snapshot.connectedTcpSockets > 0 ||
+            snapshot.bleGattConnectedCount > 0 ||
+            MeshRepository.getPeersSorted().isNotEmpty()
+        if (bannerPermission.visibility == View.VISIBLE || alreadyLinked) {
             bannerHardwareToggle.visibility = View.GONE
             return
         }
@@ -817,9 +848,9 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             btnEnableBtQuick.visibility = if (!btOn && btAdapter != null) View.VISIBLE else View.GONE
             btnEnableLocQuick.visibility = if (!locOn) View.VISIBLE else View.GONE
             tvHardwareToggleInfo.text = when {
-                !btOn && !locOn -> "Bluetooth & Lokasi HP mati. Nyalakan keduanya agar terhubung otomatis tanpa Wi-Fi."
-                !btOn -> "Bluetooth mati. Nyalakan Bluetooth untuk koneksi langsung tanpa Wi-Fi."
-                else -> "Lokasi (GPS) HP mati. Android mewajibkan Lokasi aktif untuk pindai Bluetooth & Wi-Fi Direct."
+                !btOn && !locOn -> "Bluetooth & Lokasi mati. Aturan Android OS mewajibkan keduanya untuk scan tanpa Wi-Fi (atau sambung Hotspot tanpa BT/Lokasi)."
+                !btOn -> "Bluetooth mati. Nyalakan Bluetooth untuk chat/suara tanpa Wi-Fi, atau sambungkan ke Hotspot yang sama."
+                else -> "Lokasi HP mati: Android memblokir hasil pindai Bluetooth & Wi-Fi Direct jika Lokasi mati (tidak perlu jika pakai Hotspot)."
             }
         } else {
             bannerHardwareToggle.visibility = View.GONE

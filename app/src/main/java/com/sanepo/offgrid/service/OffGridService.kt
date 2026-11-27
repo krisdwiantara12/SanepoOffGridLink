@@ -323,6 +323,12 @@ class OffGridService : Service() {
         meshTransport?.disconnectWifiDirect()
     }
 
+    fun runLocalAudioSelfTest(onDone: (Int, String) -> Unit) {
+        pttAudioEngine?.runLocalAudioSelfTest(onDone)
+    }
+
+    fun isSpeakerMuted(): Boolean = pttAudioEngine?.isSpeakerMuted() == true
+
     fun stopSelfCleanly() {
         stopAllSubsystems()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -398,6 +404,10 @@ class OffGridService : Service() {
                     }
                 }
             }
+            is OffGridProtocol.ControlEnvelope.TcpAudio -> {
+                val frame = OffGridProtocol.decodeAudioFrame(env.packetBytes, env.packetBytes.size)
+                if (frame != null) pttAudioEngine?.onIncomingAudioFrame(frame)
+            }
         }
     }
 
@@ -455,7 +465,7 @@ class OffGridService : Service() {
         } else {
             "${snap.localCallsign} | CH-%02d Siaga".format(snap.channelNumber)
         }
-        val body = "Unit sekitar terdeteksi: $peerCount | ${snap.wifiDirectRole}"
+        val body = "Unit: $peerCount | BT+: ${snap.bleGattConnectedCount} | TCP: ${snap.connectedTcpSockets}"
         return NotificationCompat.Builder(this, CHANNEL_RADIO)
             .setSmallIcon(R.drawable.ic_radio_ptt)
             .setContentTitle(title)

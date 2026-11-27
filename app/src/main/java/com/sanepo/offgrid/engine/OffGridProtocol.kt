@@ -26,18 +26,21 @@ object OffGridProtocol {
     const val AUDIO_TYPE_ROGER: Byte = 0x02
     const val AUDIO_TYPE_ADPCM_16K: Byte = 0x03
     const val AUDIO_TYPE_ADPCM_8K: Byte = 0x04
+    const val AUDIO_TYPE_PING: Byte = 0x05
     const val AUDIO_HEADER_BYTES = 12
 
-    const val GATT_FRAME_MAGIC: Byte = 0xAB.toByte()
+    const val GATT_MAGIC_0: Byte = 0xAB.toByte()
+    const val GATT_MAGIC_1: Byte = 0x5A.toByte()
     const val GATT_TYPE_JSON: Byte = 0x01
     const val GATT_TYPE_AUDIO: Byte = 0x02
-    const val GATT_FRAME_HEADER_BYTES = 4
+    const val GATT_FRAME_HEADER_BYTES = 5
 
     const val MSG_HELLO = "HELLO"
     const val MSG_CHAT = "CHAT"
     const val MSG_CHAT_ACK = "CHAT_ACK"
     const val MSG_SOS = "SOS"
     const val MSG_PTT_FLOOR = "PTT_FLOOR"
+    const val MSG_TCP_AUDIO = "AUD"
 
     data class BleBeaconPacket(
         val nodeId: String,
@@ -102,6 +105,10 @@ object OffGridProtocol {
             val latitude: Double?,
             val longitude: Double?,
             val batteryPercent: Int
+        ) : ControlEnvelope()
+
+        data class TcpAudio(
+            val packetBytes: ByteArray
         ) : ControlEnvelope()
     }
 
@@ -212,7 +219,8 @@ object OffGridProtocol {
         if (type != AUDIO_TYPE_PCM &&
             type != AUDIO_TYPE_ROGER &&
             type != AUDIO_TYPE_ADPCM_16K &&
-            type != AUDIO_TYPE_ADPCM_8K
+            type != AUDIO_TYPE_ADPCM_8K &&
+            type != AUDIO_TYPE_PING
         ) return null
         val channel = clampChannel(buffer.get().toInt() and 0xFF)
         val senderId = formatNodeIdHex(buffer.int)
@@ -286,8 +294,38 @@ object OffGridProtocol {
                     obj.put("lon", envelope.longitude)
                 }
             }
+            is ControlEnvelope.TcpAudio -> {
+                obj.put("t", MSG_TCP_AUDIO)
+                obj.put("d", toHexString(envelope.packetBytes))
+            }
         }
         return obj.toString()
+    }
+
+    fun toHexString(bytes: ByteArray): String {
+        val hexChars = "0123456789ABCDEF"
+        val out = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val v = b.toInt() and 0xFF
+            out.append(hexChars[v ushr 4])
+            out.append(hexChars[v and 0x0F])
+        }
+        return out.toString()
+    }
+
+    fun fromHexString(hex: String): ByteArray? {
+        val clean = hex.trim()
+        if (clean.isEmpty() || (clean.length and 1) != 0) return null
+        val out = ByteArray(clean.length / 2)
+        var i = 0
+        while (i < clean.length) {
+            val hi = Character.digit(clean[i], 16)
+            val lo = Character.digit(clean[i + 1], 16)
+            if (hi < 0 || lo < 0) return null
+            out[i ushr 1] = ((hi shl 4) or lo).toByte()
+            i += 2
+        }
+        return out
     }
 
     fun decodeControlJson(raw: String): ControlEnvelope? {
@@ -362,6 +400,10 @@ object OffGridProtocol {
                         longitude = lon,
                         batteryPercent = obj.optInt("bat", -1)
                     )
+                }
+                MSG_TCP_AUDIO -> {
+                    val bytes = fromHexString(obj.optString("d")) ?: return null
+                    ControlEnvelope.TcpAudio(bytes)
                 }
                 else -> null
             }
@@ -600,20 +642,30 @@ class GattFrameAccumulator {
         val combined = ByteArray(buffer.size + chunk.size)
         System.arraycopy(buffer, 0, combined, 0, buffer.size)
         System.arraycopy(chunk, 0, combined, buffer.size, chunk.size)
-        buffer = combined
+        buffer = if (combined.size > 8192) {
+            combined.copyOfRange(combined.size - 4096, combined.size)
+        } else {
+            combined
+        }
 
         val out = mutableListOf<Pair<Byte, ByteArray>>()
         var offset = 0
         while (offset + OffGridProtocol.GATT_FRAME_HEADER_BYTES <= buffer.size) {
-            if (buffer[offset] != OffGridProtocol.GATT_FRAME_MAGIC) {
+            if (buffer[offset] != OffGridProtocol.GATT_MAGIC_0 ||
+                buffer[offset + 1] != OffGridProtocol.GATT_MAGIC_1
+            ) {
                 offset++
                 continue
             }
-            val type = buffer[offset + 1]
-            val len = ((buffer[offset + 2].toInt() and 0xFF) shl 8) or
-                (buffer[offset + 3].toInt() and 0xFF)
-            if (len <= 0 || len > 16_384) {
-                offset++
+            val type = buffer[offset + 2]
+            if (type != OffGridProtocol.GATT_TYPE_JSON && type != OffGridProtocol.GATT_TYPE_AUDIO) {
+                offset += 2
+                continue
+            }
+            val len = ((buffer[offset + 3].toInt() and 0xFF) shl 8) or
+                (buffer[offset + 4].toInt() and 0xFF)
+            if (len <= 0 || len > 4096) {
+                offset += 2
                 continue
             }
             val totalNeed = offset + OffGridProtocol.GATT_FRAME_HEADER_BYTES + len
@@ -633,10 +685,11 @@ class GattFrameAccumulator {
     companion object {
         fun wrapFrame(type: Byte, payload: ByteArray): ByteArray {
             val out = ByteArray(OffGridProtocol.GATT_FRAME_HEADER_BYTES + payload.size)
-            out[0] = OffGridProtocol.GATT_FRAME_MAGIC
-            out[1] = type
-            out[2] = ((payload.size ushr 8) and 0xFF).toByte()
-            out[3] = (payload.size and 0xFF).toByte()
+            out[0] = OffGridProtocol.GATT_MAGIC_0
+            out[1] = OffGridProtocol.GATT_MAGIC_1
+            out[2] = type
+            out[3] = ((payload.size ushr 8) and 0xFF).toByte()
+            out[4] = (payload.size and 0xFF).toByte()
             System.arraycopy(payload, 0, out, OffGridProtocol.GATT_FRAME_HEADER_BYTES, payload.size)
             return out
         }

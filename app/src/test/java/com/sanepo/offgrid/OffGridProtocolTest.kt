@@ -228,4 +228,30 @@ class OffGridProtocolTest {
         assertFalse(AppUpdateManager.isValidApkHeaderAndSize("<!DO".toByteArray(), 4, 890_000L))
         assertFalse(AppUpdateManager.isValidApkHeaderAndSize(byteArrayOf(0x50, 0x4B, 0x03, 0x04), 4, 25_000L))
     }
+
+    @Test
+    fun tcpAudioFallbackAndNoiseResistantGattFramingWorkCleanly() {
+        val rawAudio = byteArrayOf(0x53, 0x4E, 0x03, 0x01, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00, 0x05, 0x7A, 0x1B)
+        val tcpJson = OffGridProtocol.encodeControlJson(OffGridProtocol.ControlEnvelope.TcpAudio(rawAudio))
+        val decoded = OffGridProtocol.decodeControlJson(tcpJson) as OffGridProtocol.ControlEnvelope.TcpAudio
+        assertArrayEquals(rawAudio, decoded.packetBytes)
+
+        // Ensure stray 0xAB noise bytes inside GATT stream do not wedge valid frames
+        val acc = GattFrameAccumulator()
+        val noisyPrefix = byteArrayOf(0xAB.toByte(), 0x11, 0x7F, 0x7F, 0xAB.toByte(), 0x5A, 0x99.toByte())
+        val validFrame = GattFrameAccumulator.wrapFrame(OffGridProtocol.GATT_TYPE_AUDIO, rawAudio)
+        val results = acc.feed(noisyPrefix + validFrame)
+        assertEquals(1, results.size)
+        assertArrayEquals(rawAudio, results[0].second)
+
+        // Soft preamp gain amplifies quiet sample cleanly and prevents 16-bit signed overflow
+        val pcmSamples = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(1000)
+            .putShort(-30000)
+            .array()
+        PttAudioEngine.applySoftGainInPlace(pcmSamples, pcmSamples.size, gainPercent = 165)
+        val outBuf = ByteBuffer.wrap(pcmSamples).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(1650, outBuf.getShort(0).toInt())
+        assertEquals(-32767, outBuf.getShort(2).toInt())
+    }
 }

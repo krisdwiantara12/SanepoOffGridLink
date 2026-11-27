@@ -47,22 +47,26 @@ class BleGattTransport(
         var dataChar: BluetoothGattCharacteristic? = null,
         var mtuPayload: Int = 20,
         var ready: Boolean = false,
+        var servicesRequested: Boolean = false,
         var inFlight: Boolean = false,
+        var writeToken: Long = 0L,
         val queue: ArrayDeque<Pair<ByteArray, Boolean>> = ArrayDeque(),
         val accumulator: GattFrameAccumulator = GattFrameAccumulator()
     )
 
     private data class InboundServerPeer(
         val device: BluetoothDevice,
+        var nodeId: String? = null,
         var mtuPayload: Int = 20,
         var subscribed: Boolean = false,
         var inFlight: Boolean = false,
+        var writeToken: Long = 0L,
         val queue: ArrayDeque<ByteArray> = ArrayDeque(),
         val accumulator: GattFrameAccumulator = GattFrameAccumulator()
     )
 
-    private val clientSessions = ConcurrentHashMap<String, OutboundClientSession>() // keyed by nodeId
-    private val serverPeers = ConcurrentHashMap<String, InboundServerPeer>() // keyed by device.address
+    private val clientSessions = ConcurrentHashMap<String, OutboundClientSession>()
+    private val serverPeers = ConcurrentHashMap<String, InboundServerPeer>()
     private val macToNodeId = ConcurrentHashMap<String, String>()
     private val lastAttemptByNode = ConcurrentHashMap<String, Long>()
     private val lock = Any()
@@ -128,21 +132,21 @@ class BleGattTransport(
 
         val mac = device.address ?: return
         macToNodeId[mac] = packet.nodeId
+        serverPeers[mac]?.nodeId = packet.nodeId
 
-        // Already connected as server peer or active outbound client?
-        if (serverPeers[mac]?.subscribed == true) return
+        val serverLinkedForNode = serverPeers.values.any { it.subscribed && it.nodeId == packet.nodeId }
+        if (serverPeers[mac]?.subscribed == true || serverLinkedForNode) return
         val existing = clientSessions[packet.nodeId]
         if (existing != null && existing.gatt != null && existing.ready) return
 
         val now = System.currentTimeMillis()
         val lastTry = lastAttemptByNode[packet.nodeId] ?: 0L
-        // Higher nodeId connects first; lower waits 7s before fallback connect to prevent dual connection churn
-        val minWait = if (localId > packet.nodeId) 7_000L else 12_000L
+        val minWait = if (localId > packet.nodeId) 5_000L else 7_000L
         if (now - lastTry < minWait) return
 
-        // Avoid redundant active connect if first sighting and lower ID (wait peer to initiate)
+        // Wait 3.5s on initial lower-ID sighting so higher ID connects once cleanly, then fall back
         if (lastTry == 0L && localId < packet.nodeId) {
-            lastAttemptByNode[packet.nodeId] = now
+            lastAttemptByNode[packet.nodeId] = now - (minWait - 3_500L)
             return
         }
         lastAttemptByNode[packet.nodeId] = now
@@ -156,27 +160,31 @@ class BleGattTransport(
     fun sendControlJsonToAll(json: String, highPriority: Boolean = true) {
         if (!running || btAdapter?.isEnabled != true) return
         if (!PermissionHelper.hasBleConnectPermission(context)) return
-        val framed = GattFrameCodecHelper.wrap(OffGridProtocol.GATT_TYPE_JSON, json.toByteArray(Charsets.UTF_8))
-        enqueueFrameToAllPeers(framed, urgentNoResponse = !highPriority, dropAudioIfCongested = false)
+        val framed = GattFrameAccumulator.wrapFrame(OffGridProtocol.GATT_TYPE_JSON, json.toByteArray(Charsets.UTF_8))
+        enqueueFrameToAllPeers(framed, urgentNoResponse = !highPriority, isAudio = false)
     }
 
     fun sendAudioFrameToAll(audioPacket: ByteArray) {
         if (!running || btAdapter?.isEnabled != true) return
         if (!PermissionHelper.hasBleConnectPermission(context)) return
-        val framed = GattFrameCodecHelper.wrap(OffGridProtocol.GATT_TYPE_AUDIO, audioPacket)
-        enqueueFrameToAllPeers(framed, urgentNoResponse = true, dropAudioIfCongested = true)
+        val framed = GattFrameAccumulator.wrapFrame(OffGridProtocol.GATT_TYPE_AUDIO, audioPacket)
+        enqueueFrameToAllPeers(framed, urgentNoResponse = true, isAudio = true)
     }
 
     private fun enqueueFrameToAllPeers(
         framedBytes: ByteArray,
         urgentNoResponse: Boolean,
-        dropAudioIfCongested: Boolean
+        isAudio: Boolean
     ) {
+        val sentNodeIds = HashSet<String>()
         synchronized(lock) {
             for (session in clientSessions.values) {
                 if (!session.ready || session.gatt == null || session.dataChar == null) continue
-                if (dropAudioIfCongested && session.queue.size > 6) continue
+                if (!sentNodeIds.add(session.nodeId)) continue
                 val step = maxOf(20, session.mtuPayload)
+                val neededChunks = (framedBytes.size + step - 1) / step
+                // Check whole-frame queue headroom before splitting so partial frames never corrupt GATT sync
+                if (isAudio && session.queue.size + neededChunks > 24) continue
                 var pos = 0
                 while (pos < framedBytes.size) {
                     val end = minOf(framedBytes.size, pos + step)
@@ -187,8 +195,11 @@ class BleGattTransport(
             }
             for (peer in serverPeers.values) {
                 if (!peer.subscribed) continue
-                if (dropAudioIfCongested && peer.queue.size > 6) continue
+                val peerNodeId = peer.nodeId ?: macToNodeId[peer.device.address]
+                if (peerNodeId != null && !sentNodeIds.add(peerNodeId)) continue
                 val step = maxOf(20, peer.mtuPayload)
+                val neededChunks = (framedBytes.size + step - 1) / step
+                if (isAudio && peer.queue.size + neededChunks > 24) continue
                 var pos = 0
                 while (pos < framedBytes.size) {
                     val end = minOf(framedBytes.size, pos + step)
@@ -247,8 +258,21 @@ class BleGattTransport(
                     session.gatt = gatt
                     try {
                         gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                        if (!gatt.requestMtu(247)) {
+                        val mtuStarted = gatt.requestMtu(517)
+                        if (!mtuStarted) {
+                            session.servicesRequested = true
                             gatt.discoverServices()
+                        } else {
+                            // Some MediaTek/OEM BLE stacks drop onMtuChanged; ensure service discovery always starts
+                            mainHandler.postDelayed({
+                                if (!session.servicesRequested && running && session.gatt === gatt) {
+                                    session.servicesRequested = true
+                                    try {
+                                        gatt.discoverServices()
+                                    } catch (_: Throwable) {
+                                    }
+                                }
+                            }, 1500L)
                         }
                     } catch (_: Throwable) {
                     }
@@ -269,9 +293,12 @@ class BleGattTransport(
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                 session.mtuPayload = maxOf(20, mtu - 3)
-                try {
-                    gatt.discoverServices()
-                } catch (_: Throwable) {
+                if (!session.servicesRequested) {
+                    session.servicesRequested = true
+                    try {
+                        gatt.discoverServices()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
 
@@ -298,6 +325,7 @@ class BleGattTransport(
             override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                 synchronized(lock) {
                     session.inFlight = false
+                    session.writeToken++
                     drainClientQueue(session)
                 }
             }
@@ -307,7 +335,7 @@ class BleGattTransport(
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                     @Suppress("DEPRECATION")
                     val bytes = characteristic.value ?: return
-                    handleIncomingBytes(session.accumulator, bytes, macToNodeId[session.deviceAddress])
+                    handleIncomingBytes(session.accumulator, bytes, session.nodeId, session.deviceAddress)
                 }
             }
 
@@ -316,7 +344,7 @@ class BleGattTransport(
                 characteristic: BluetoothGattCharacteristic,
                 value: ByteArray
             ) {
-                handleIncomingBytes(session.accumulator, value, macToNodeId[session.deviceAddress])
+                handleIncomingBytes(session.accumulator, value, session.nodeId, session.deviceAddress)
             }
         }
 
@@ -357,6 +385,7 @@ class BleGattTransport(
         val ch = session.dataChar ?: return
         val (chunk, noResponse) = session.queue.removeFirst()
         session.inFlight = true
+        val token = ++session.writeToken
         val writeType = if (noResponse) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         } else {
@@ -365,11 +394,13 @@ class BleGattTransport(
         val ok = writeCharacteristicCompat(gatt, ch, chunk, writeType)
         if (!ok) {
             session.inFlight = false
+            session.writeToken++
         } else {
             mainHandler.postDelayed({
                 synchronized(lock) {
-                    if (session.inFlight) {
+                    if (session.inFlight && session.writeToken == token) {
                         session.inFlight = false
+                        session.writeToken++
                         drainClientQueue(session)
                     }
                 }
@@ -384,14 +415,17 @@ class BleGattTransport(
         val ch = serverChar ?: return
         val chunk = peer.queue.removeFirst()
         peer.inFlight = true
+        val token = ++peer.writeToken
         val ok = notifyCharacteristicCompat(server, peer.device, ch, chunk)
         if (!ok) {
             peer.inFlight = false
+            peer.writeToken++
         } else {
             mainHandler.postDelayed({
                 synchronized(lock) {
-                    if (peer.inFlight) {
+                    if (peer.inFlight && peer.writeToken == token) {
                         peer.inFlight = false
+                        peer.writeToken++
                         drainServerQueue(peer)
                     }
                 }
@@ -405,7 +439,7 @@ class BleGattTransport(
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 synchronized(lock) {
                     if (!serverPeers.containsKey(mac)) {
-                        serverPeers[mac] = InboundServerPeer(device)
+                        serverPeers[mac] = InboundServerPeer(device, nodeId = macToNodeId[mac])
                     }
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -432,7 +466,9 @@ class BleGattTransport(
             value: ByteArray?
         ) {
             val mac = device.address ?: return
-            val peer = serverPeers[mac] ?: InboundServerPeer(device).also { serverPeers[mac] = it }
+            val peer = serverPeers[mac] ?: InboundServerPeer(device, nodeId = macToNodeId[mac]).also {
+                serverPeers[mac] = it
+            }
             if (descriptor.uuid == UUID_CCCD) {
                 val enabled = value != null && value.isNotEmpty() && (value[0].toInt() and 0x01) != 0
                 peer.subscribed = enabled
@@ -482,8 +518,10 @@ class BleGattTransport(
             }
             val mac = device.address ?: return
             val bytes = value ?: return
-            val peer = serverPeers[mac] ?: InboundServerPeer(device).also { serverPeers[mac] = it }
-            handleIncomingBytes(peer.accumulator, bytes, macToNodeId[mac])
+            val peer = serverPeers[mac] ?: InboundServerPeer(device, nodeId = macToNodeId[mac]).also {
+                serverPeers[mac] = it
+            }
+            handleIncomingBytes(peer.accumulator, bytes, peer.nodeId, mac)
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
@@ -491,6 +529,7 @@ class BleGattTransport(
             val peer = serverPeers[mac] ?: return
             synchronized(lock) {
                 peer.inFlight = false
+                peer.writeToken++
                 drainServerQueue(peer)
             }
         }
@@ -499,18 +538,28 @@ class BleGattTransport(
     private fun handleIncomingBytes(
         accumulator: GattFrameAccumulator,
         chunk: ByteArray,
-        nodeIdHint: String?
+        nodeIdHint: String?,
+        sourceMac: String?
     ) {
         val frames = synchronized(accumulator) { accumulator.feed(chunk) }
         for ((type, payload) in frames) {
             when (type) {
                 OffGridProtocol.GATT_TYPE_JSON -> {
                     val json = String(payload, Charsets.UTF_8)
+                    val decoded = OffGridProtocol.decodeControlJson(json)
+                    if (decoded is OffGridProtocol.ControlEnvelope.Hello && sourceMac != null) {
+                        macToNodeId[sourceMac] = decoded.nodeId
+                        serverPeers[sourceMac]?.nodeId = decoded.nodeId
+                    }
                     onControlJsonReceived(json, nodeIdHint)
                 }
                 OffGridProtocol.GATT_TYPE_AUDIO -> {
                     val audio = OffGridProtocol.decodeAudioFrame(payload, payload.size)
                     if (audio != null) {
+                        if (sourceMac != null) {
+                            macToNodeId[sourceMac] = audio.senderNodeId
+                            serverPeers[sourceMac]?.nodeId = audio.senderNodeId
+                        }
                         onAudioFrameReceived(audio)
                     }
                 }
@@ -582,9 +631,5 @@ class BleGattTransport(
         MeshRepository.updateSnapshot(forceImmediate = true) {
             copy(bleGattConnectedCount = active)
         }
-    }
-
-    private object GattFrameCodecHelper {
-        fun wrap(type: Byte, payload: ByteArray): ByteArray = GattFrameAccumulator.wrapFrame(type, payload)
     }
 }
