@@ -1,0 +1,4 @@
+-keep class com.sanepo.offgrid.model.** { *; }
+-keep class com.sanepo.offgrid.engine.** { *; }
+-dontwarn android.net.wifi.p2p.**
+-dontwarn android.bluetooth.**

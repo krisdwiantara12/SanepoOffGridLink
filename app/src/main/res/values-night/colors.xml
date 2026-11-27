@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tactical Field Night Theme (OLED Power-Saving, Low Night Glare) -->
+    <color name="bg_canvas">#0E110E</color>
+    <color name="bg_console">#171C17</color>
+    <color name="bg_keycap">#202720</color>
+    <color name="bg_well_live">#152A1B</color>
+    <color name="bg_well_warn">#2E230B</color>
+    <color name="bg_well_sos">#361515</color>
+    <color name="stroke_instrument">#6A7A6A</color>
+    <color name="stroke_subtle">#354035</color>
+
+    <color name="ink_primary">#F2F4EF</color>
+    <color name="ink_secondary">#B2BDB0</color>
+    <color name="accent_fill">#FFB300</color>
+    <color name="ink_on_accent">#111410</color>
+    <color name="accent_ink">#FFB300</color>
+
+    <color name="status_live">#5CE085</color>
+    <color name="status_warn">#FFB300</color>
+    <color name="sos_fill">#DC2626</color>
+    <color name="ink_on_sos">#FFFFFF</color>
+    <color name="sos_ink">#FF6E6E</color>
+</resources>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Azimuth compass bezel & crosshairs -->
+    <path
+        android:pathData="M12,3 A9,9 0 1,1 11.99,3 Z M12,2 L12,5 M12,19 L12,22 M2,12 L5,12 M19,12 L22,12"
+        android:strokeWidth="1.9"
+        android:strokeLineCap="square"
+        android:strokeColor="#FFFFFFFF" />
+    <!-- Bearing pointer needle -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M15.5,8.5 L13.2,13.2 L8.5,15.5 L10.8,10.8 Z" />
+</vector>

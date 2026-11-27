@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sanepo OffGrid Link</string>
+    <string name="app_subtitle">Radio &amp; Radar P2P Tanpa Internet</string>
+
+    <string name="tab_radio">Radio PTT</string>
+    <string name="tab_radar">Radar</string>
+    <string name="tab_chat">Chat</string>
+    <string name="tab_nodes">Jaringan</string>
+
+    <string name="notif_channel_name">Radio &amp; Jaringan OffGrid</string>
+    <string name="notif_channel_sos">Peringatan SOS Darurat</string>
+    <string name="action_stop_service">Matikan Radio</string>
+
+    <string name="desc_theme_toggle">Ganti tema siang atau malam</string>
+    <string name="desc_about">Tentang aplikasi dan cek update</string>
+    <string name="desc_sos">Tombol SOS darurat tahan 2 detik</string>
+    <string name="desc_back">Kembali</string>
+</resources>
