@@ -202,6 +202,58 @@
             android:textStyle="bold" />
     </LinearLayout>
 
+    <!-- Conditional Hardware Radio Toggle Banner (Bluetooth / Location OFF) -->
+    <LinearLayout
+        android:id="@+id/bannerHardwareToggle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/bg_well_warn"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="8dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/tvHardwareToggleInfo"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Nyalakan Bluetooth &amp; Lokasi di kedua HP agar bisa langsung tersambung otomatis tanpa Wi-Fi."
+            android:textColor="@color/ink_primary"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnEnableBtQuick"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:background="@drawable/bg_accent_btn"
+            android:minHeight="44dp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:text="Nyalakan BT"
+            android:textColor="@color/ink_on_accent"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnEnableLocQuick"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:background="@drawable/bg_keycap_btn"
+            android:minHeight="44dp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:text="Lokasi"
+            android:textColor="@color/ink_primary"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
     <!-- Primary Dynamic Workspace Content -->
     <FrameLayout
         android:layout_width="match_parent"
@@ -733,7 +785,7 @@
                     android:layout_marginTop="10dp"
                     android:background="@drawable/bg_well_live"
                     android:padding="12dp"
-                    android:text="Cara sambung 2+ HP tanpa kuota: (1) Tekan Buat Host P2P di 1 HP lalu HP lain Pindai P2P &amp; Sambung, ATAU (2) Nyalakan Hotspot dari 1 HP tanpa pulsa dan HP lain hubungkan Wi-Fi ke sana."
+                    android:text="Cara sambung 100% offline: (1) Tanpa Wi-Fi sama sekali: nyalakan Bluetooth &amp; Lokasi di kedua HP untuk koneksi BLE GATT otomatis (chat, radar, SOS, suara PTT 8kHz). (2) Untuk suara HD jarak jauh: nyalakan Wi-Fi lalu tekan Buat Host P2P / gabung Hotspot tanpa kuota."
                     android:textColor="@color/ink_primary"
                     android:textSize="12sp" />
 

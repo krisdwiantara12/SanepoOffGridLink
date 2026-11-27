@@ -174,11 +174,16 @@ object MeshRepository {
     fun upsertPeerFromNetwork(
         hello: OffGridProtocol.ControlEnvelope.Hello,
         remoteIp: String?,
-        viaWifiDirect: Boolean
+        viaWifiDirect: Boolean,
+        viaBleGatt: Boolean = false
     ) {
         if (hello.nodeId == snapshot.localNodeId) return
         val now = System.currentTimeMillis()
-        val linkType = if (viaWifiDirect) TransportLinkType.WIFI_DIRECT else TransportLinkType.LOCAL_LAN
+        val linkType = when {
+            viaBleGatt -> TransportLinkType.BLE_GATT
+            viaWifiDirect -> TransportLinkType.WIFI_DIRECT
+            else -> TransportLinkType.LOCAL_LAN
+        }
         mutatePeer(hello.nodeId) { existing ->
             (existing ?: PeerNode(
                 nodeId = hello.nodeId,

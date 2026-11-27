@@ -20,6 +20,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.sanepo.offgrid.R
 import com.sanepo.offgrid.engine.BleBeaconEngine
+import com.sanepo.offgrid.engine.BleGattTransport
 import com.sanepo.offgrid.engine.CompassRadarEngine
 import com.sanepo.offgrid.engine.LocalMeshTransport
 import com.sanepo.offgrid.engine.MeshRepository
@@ -54,6 +55,7 @@ class OffGridService : Service() {
 
     private val binder = LocalBinder()
     private var bleEngine: BleBeaconEngine? = null
+    private var bleGattTransport: BleGattTransport? = null
     private var meshTransport: LocalMeshTransport? = null
     private var pttAudioEngine: PttAudioEngine? = null
     private var compassRadarEngine: CompassRadarEngine? = null
@@ -84,15 +86,33 @@ class OffGridService : Service() {
         createNotificationChannels()
 
         sosController = SosBeaconController(this)
-        bleEngine = BleBeaconEngine(this) { bleSos ->
-            showIncomingSosNotification(bleSos.callsign, bleSos.latitude, bleSos.longitude)
-        }
+        bleGattTransport = BleGattTransport(
+            context = this,
+            onControlJsonReceived = { json, _ -> handleIncomingBleControlJson(json) },
+            onAudioFrameReceived = { frame -> pttAudioEngine?.onIncomingAudioFrame(frame) }
+        )
+        bleEngine = BleBeaconEngine(
+            context = this,
+            onBeaconSeen = { device, packet, _ ->
+                bleGattTransport?.onBeaconSeen(device, packet)
+            },
+            onBluetoothPowerChanged = { enabled ->
+                if (enabled) bleGattTransport?.onBluetoothEnabled()
+                else bleGattTransport?.onBluetoothDisabled()
+            },
+            onRemoteSosTriggered = { bleSos ->
+                showIncomingSosNotification(bleSos.callsign, bleSos.latitude, bleSos.longitude)
+            }
+        )
         pttAudioEngine = PttAudioEngine(
             context = this,
-            onSendAudioFrame = { bytes -> meshTransport?.sendAudioFrameToPeers(bytes) },
+            onSendIpAudioFrame = { bytes -> meshTransport?.sendAudioFrameToPeers(bytes) },
+            onSendBleAudioFrame = { bytes -> bleGattTransport?.sendAudioFrameToAll(bytes) },
+            hasIpTransportPeers = { meshTransport?.hasNetworkPeers() == true },
+            hasBleGattPeers = { bleGattTransport?.hasActiveConnections() == true },
             onSendPttFloor = { speaking ->
                 val snap = MeshRepository.getSnapshot()
-                meshTransport?.sendControlToAll(
+                sendControlEverywhere(
                     OffGridProtocol.ControlEnvelope.PttFloor(
                         senderId = snap.localNodeId,
                         senderCallsign = snap.localCallsign,
@@ -159,6 +179,7 @@ class OffGridService : Service() {
     fun refreshSubsystemsAfterPermissions() {
         startForegroundSafe()
         bleEngine?.start()
+        bleGattTransport?.start()
         compassRadarEngine?.refreshLocationPermissions()
         updateServiceNotification()
     }
@@ -167,6 +188,23 @@ class OffGridService : Service() {
         MeshRepository.updateIdentity(this, callsign, channelNumber)
         bleEngine?.scheduleAdvertiseRefresh()
         meshTransport?.refreshLocalServiceIdentity()
+        val snap = MeshRepository.getSnapshot()
+        bleGattTransport?.sendControlJsonToAll(
+            OffGridProtocol.encodeControlJson(
+                OffGridProtocol.ControlEnvelope.Hello(
+                    nodeId = snap.localNodeId,
+                    callsign = snap.localCallsign,
+                    channelNumber = snap.channelNumber,
+                    tcpPort = OffGridProtocol.TCP_MESH_PORT,
+                    batteryPercent = snap.batteryPercent,
+                    isSos = snap.localSosActive,
+                    latitude = snap.localLatitude,
+                    longitude = snap.localLongitude,
+                    altitudeMeters = snap.localAltitudeMeters,
+                    accuracyMeters = snap.localGpsAccuracyMeters
+                )
+            )
+        )
         updateServiceNotification()
     }
 
@@ -214,7 +252,7 @@ class OffGridService : Service() {
             longitude = lon
         )
         MeshRepository.appendOutgoingMessage(outgoing)
-        meshTransport?.sendControlToAll(
+        sendControlEverywhere(
             OffGridProtocol.ControlEnvelope.Chat(
                 msgId = msgId,
                 senderId = snap.localNodeId,
@@ -236,7 +274,7 @@ class OffGridService : Service() {
             copy(localSosActive = next)
         }
         val snap = MeshRepository.getSnapshot()
-        meshTransport?.sendControlToAll(
+        sendControlEverywhere(
             OffGridProtocol.ControlEnvelope.SosSignal(
                 senderId = snap.localNodeId,
                 senderCallsign = snap.localCallsign,
@@ -299,6 +337,7 @@ class OffGridService : Service() {
     private fun startAllSubsystems() {
         pttAudioEngine?.startPlayback()
         bleEngine?.start()
+        bleGattTransport?.start()
         meshTransport?.start()
         compassRadarEngine?.start()
         MeshRepository.updateSnapshot(forceImmediate = true) {
@@ -310,10 +349,55 @@ class OffGridService : Service() {
         sosController?.stopSosPatterns()
         pttAudioEngine?.stopAll()
         bleEngine?.stop()
+        bleGattTransport?.stop()
         meshTransport?.stop()
         compassRadarEngine?.stop()
         MeshRepository.updateSnapshot(forceImmediate = true) {
             copy(isEngineRunning = false, isLocalTransmitting = false, localSosActive = false)
+        }
+    }
+
+    private fun sendControlEverywhere(envelope: OffGridProtocol.ControlEnvelope) {
+        meshTransport?.sendControlToAll(envelope)
+        bleGattTransport?.sendControlJsonToAll(OffGridProtocol.encodeControlJson(envelope))
+    }
+
+    private fun handleIncomingBleControlJson(rawJson: String) {
+        val env = OffGridProtocol.decodeControlJson(rawJson) ?: return
+        val localId = MeshRepository.getSnapshot().localNodeId
+        when (env) {
+            is OffGridProtocol.ControlEnvelope.Hello -> {
+                if (env.nodeId != localId) {
+                    MeshRepository.upsertPeerFromNetwork(env, remoteIp = null, viaWifiDirect = false, viaBleGatt = true)
+                }
+            }
+            is OffGridProtocol.ControlEnvelope.Chat -> {
+                if (env.senderId != localId && MeshRepository.appendIncomingMessage(env)) {
+                    val ack = OffGridProtocol.ControlEnvelope.ChatAck(msgId = env.msgId, receiverId = localId)
+                    sendControlEverywhere(ack)
+                    if (env.isSos) {
+                        showIncomingSosNotification(env.senderCallsign, env.latitude, env.longitude)
+                    }
+                }
+            }
+            is OffGridProtocol.ControlEnvelope.ChatAck -> {
+                if (env.receiverId != localId) {
+                    MeshRepository.markMessageAcked(env.msgId, env.receiverId)
+                }
+            }
+            is OffGridProtocol.ControlEnvelope.PttFloor -> {
+                if (env.senderId != localId) {
+                    MeshRepository.updatePeerAudioFloor(env)
+                }
+            }
+            is OffGridProtocol.ControlEnvelope.SosSignal -> {
+                if (env.senderId != localId) {
+                    MeshRepository.updatePeerSosState(env, remoteIp = null)
+                    if (env.active) {
+                        showIncomingSosNotification(env.senderCallsign, env.latitude, env.longitude)
+                    }
+                }
+            }
         }
     }
 

@@ -24,7 +24,14 @@ object OffGridProtocol {
     const val AUDIO_MAGIC_1: Byte = 0x4E // 'N'
     const val AUDIO_TYPE_PCM: Byte = 0x01
     const val AUDIO_TYPE_ROGER: Byte = 0x02
+    const val AUDIO_TYPE_ADPCM_16K: Byte = 0x03
+    const val AUDIO_TYPE_ADPCM_8K: Byte = 0x04
     const val AUDIO_HEADER_BYTES = 12
+
+    const val GATT_FRAME_MAGIC: Byte = 0xAB.toByte()
+    const val GATT_TYPE_JSON: Byte = 0x01
+    const val GATT_TYPE_AUDIO: Byte = 0x02
+    const val GATT_FRAME_HEADER_BYTES = 4
 
     const val MSG_HELLO = "HELLO"
     const val MSG_CHAT = "CHAT"
@@ -202,7 +209,11 @@ object OffGridProtocol {
         if (bytes[0] != AUDIO_MAGIC_0 || bytes[1] != AUDIO_MAGIC_1) return null
         val buffer = ByteBuffer.wrap(bytes, 2, length - 2).order(ByteOrder.BIG_ENDIAN)
         val type = buffer.get()
-        if (type != AUDIO_TYPE_PCM && type != AUDIO_TYPE_ROGER) return null
+        if (type != AUDIO_TYPE_PCM &&
+            type != AUDIO_TYPE_ROGER &&
+            type != AUDIO_TYPE_ADPCM_16K &&
+            type != AUDIO_TYPE_ADPCM_8K
+        ) return null
         val channel = clampChannel(buffer.get().toInt() and 0xFF)
         val senderId = formatNodeIdHex(buffer.int)
         val seq = buffer.int
@@ -418,6 +429,216 @@ object GeoMath {
         return when {
             meters < 1000.0 -> "${meters.roundToInt()} m"
             else -> "%.2f km".format(meters / 1000.0)
+        }
+    }
+}
+
+object ImaAdpcmCodec {
+    private val INDEX_TABLE = intArrayOf(
+        -1, -1, -1, -1, 2, 4, 6, 8,
+        -1, -1, -1, -1, 2, 4, 6, 8
+    )
+
+    private val STEP_TABLE = intArrayOf(
+        7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+        19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+        50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+        130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+        337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+        876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+        2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+        5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+        15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+    )
+
+    class EncoderState {
+        var stepIndex: Int = 0
+    }
+
+    fun encodePcm16Le(pcmBytes: ByteArray, length: Int = pcmBytes.size, state: EncoderState? = null): ByteArray {
+        val sampleCount = length / 2
+        if (sampleCount <= 0) return ByteArray(0)
+        val firstLo = pcmBytes[0].toInt() and 0xFF
+        val firstHi = pcmBytes[1].toInt()
+        var predictor = ((firstHi shl 8) or firstLo).toShort().toInt()
+        var index = (state?.stepIndex ?: 0).coerceIn(0, 88)
+
+        val codedCount = sampleCount - 1
+        val nibbleBytes = (codedCount + 1) / 2
+        val out = ByteArray(4 + nibbleBytes)
+        out[0] = (predictor ushr 8).toByte()
+        out[1] = (predictor and 0xFF).toByte()
+        out[2] = index.toByte()
+        out[3] = if ((codedCount % 2) == 1) 1 else 0
+
+        var outPos = 4
+        var lowNibble = true
+        var currentByte = 0
+
+        for (i in 1 until sampleCount) {
+            val bOff = i * 2
+            val sLo = pcmBytes[bOff].toInt() and 0xFF
+            val sHi = pcmBytes[bOff + 1].toInt()
+            val sample = ((sHi shl 8) or sLo).toShort().toInt()
+
+            val step = STEP_TABLE[index]
+            var diff = sample - predictor
+            var code = 0
+            if (diff < 0) {
+                code = 8
+                diff = -diff
+            }
+            var vpdiff = step ushr 3
+            if (diff >= step) {
+                code = code or 4
+                diff -= step
+                vpdiff += step
+            }
+            val halfStep = step ushr 1
+            if (diff >= halfStep) {
+                code = code or 2
+                diff -= halfStep
+                vpdiff += halfStep
+            }
+            val quarterStep = step ushr 2
+            if (diff >= quarterStep) {
+                code = code or 1
+                vpdiff += quarterStep
+            }
+            predictor = if ((code and 8) != 0) predictor - vpdiff else predictor + vpdiff
+            predictor = predictor.coerceIn(-32768, 32767)
+            index = (index + INDEX_TABLE[code]).coerceIn(0, 88)
+
+            if (lowNibble) {
+                currentByte = code and 0x0F
+                lowNibble = false
+            } else {
+                out[outPos++] = (currentByte or ((code and 0x0F) shl 4)).toByte()
+                lowNibble = true
+            }
+        }
+        if (!lowNibble) {
+            out[outPos] = currentByte.toByte()
+        }
+        state?.stepIndex = index
+        return out
+    }
+
+    fun decodeToPcm16Le(adpcmBytes: ByteArray): ByteArray {
+        if (adpcmBytes.size < 4) return ByteArray(0)
+        var predictor = (((adpcmBytes[0].toInt() and 0xFF) shl 8) or (adpcmBytes[1].toInt() and 0xFF)).toShort().toInt()
+        var index = (adpcmBytes[2].toInt() and 0xFF).coerceIn(0, 88)
+        val hasOddTail = (adpcmBytes[3].toInt() and 0xFF) == 1
+        val nibbleByteCount = adpcmBytes.size - 4
+        val codedCount = maxOf(0, nibbleByteCount * 2 - if (hasOddTail) 1 else 0)
+        val totalSamples = 1 + codedCount
+
+        val out = ByteArray(totalSamples * 2)
+        out[0] = (predictor and 0xFF).toByte()
+        out[1] = (predictor ushr 8).toByte()
+
+        var outPos = 2
+        for (k in 0 until codedCount) {
+            val byteVal = adpcmBytes[4 + (k ushr 1)].toInt() and 0xFF
+            val code = if ((k and 1) == 0) (byteVal and 0x0F) else ((byteVal ushr 4) and 0x0F)
+            val step = STEP_TABLE[index]
+            var vpdiff = step ushr 3
+            if ((code and 4) != 0) vpdiff += step
+            if ((code and 2) != 0) vpdiff += step ushr 1
+            if ((code and 1) != 0) vpdiff += step ushr 2
+            predictor = if ((code and 8) != 0) predictor - vpdiff else predictor + vpdiff
+            predictor = predictor.coerceIn(-32768, 32767)
+            index = (index + INDEX_TABLE[code]).coerceIn(0, 88)
+
+            out[outPos++] = (predictor and 0xFF).toByte()
+            out[outPos++] = (predictor ushr 8).toByte()
+        }
+        return out
+    }
+
+    fun downsample16kTo8k(pcm16k: ByteArray, length: Int = pcm16k.size): ByteArray {
+        val sampleCount16k = length / 2
+        val pairs = sampleCount16k / 2
+        if (pairs <= 0) return ByteArray(0)
+        val out = ByteArray(pairs * 2)
+        for (i in 0 until pairs) {
+            val idx0 = i * 4
+            val s0 = (((pcm16k[idx0 + 1].toInt()) shl 8) or (pcm16k[idx0].toInt() and 0xFF)).toShort().toInt()
+            val s1 = (((pcm16k[idx0 + 3].toInt()) shl 8) or (pcm16k[idx0 + 2].toInt() and 0xFF)).toShort().toInt()
+            val avg = (s0 + s1) / 2
+            out[i * 2] = (avg and 0xFF).toByte()
+            out[i * 2 + 1] = (avg ushr 8).toByte()
+        }
+        return out
+    }
+
+    fun upsample8kTo16k(pcm8k: ByteArray): ByteArray {
+        val samples8k = pcm8k.size / 2
+        if (samples8k <= 0) return ByteArray(0)
+        val out = ByteArray(samples8k * 4)
+        for (i in 0 until samples8k) {
+            val sCurr = (((pcm8k[i * 2 + 1].toInt()) shl 8) or (pcm8k[i * 2].toInt() and 0xFF)).toShort().toInt()
+            val sNext = if (i + 1 < samples8k) {
+                (((pcm8k[(i + 1) * 2 + 1].toInt()) shl 8) or (pcm8k[(i + 1) * 2].toInt() and 0xFF)).toShort().toInt()
+            } else sCurr
+            val mid = (sCurr + sNext) / 2
+            val o = i * 4
+            out[o] = (sCurr and 0xFF).toByte()
+            out[o + 1] = (sCurr ushr 8).toByte()
+            out[o + 2] = (mid and 0xFF).toByte()
+            out[o + 3] = (mid ushr 8).toByte()
+        }
+        return out
+    }
+}
+
+class GattFrameAccumulator {
+    private var buffer = ByteArray(0)
+
+    fun feed(chunk: ByteArray): List<Pair<Byte, ByteArray>> {
+        if (chunk.isEmpty()) return emptyList()
+        val combined = ByteArray(buffer.size + chunk.size)
+        System.arraycopy(buffer, 0, combined, 0, buffer.size)
+        System.arraycopy(chunk, 0, combined, buffer.size, chunk.size)
+        buffer = combined
+
+        val out = mutableListOf<Pair<Byte, ByteArray>>()
+        var offset = 0
+        while (offset + OffGridProtocol.GATT_FRAME_HEADER_BYTES <= buffer.size) {
+            if (buffer[offset] != OffGridProtocol.GATT_FRAME_MAGIC) {
+                offset++
+                continue
+            }
+            val type = buffer[offset + 1]
+            val len = ((buffer[offset + 2].toInt() and 0xFF) shl 8) or
+                (buffer[offset + 3].toInt() and 0xFF)
+            if (len <= 0 || len > 16_384) {
+                offset++
+                continue
+            }
+            val totalNeed = offset + OffGridProtocol.GATT_FRAME_HEADER_BYTES + len
+            if (totalNeed > buffer.size) break
+            val payload = ByteArray(len)
+            System.arraycopy(buffer, offset + OffGridProtocol.GATT_FRAME_HEADER_BYTES, payload, 0, len)
+            out.add(type to payload)
+            offset = totalNeed
+        }
+        if (offset > 0) {
+            buffer = if (offset >= buffer.size) ByteArray(0)
+            else buffer.copyOfRange(offset, buffer.size)
+        }
+        return out
+    }
+
+    companion object {
+        fun wrapFrame(type: Byte, payload: ByteArray): ByteArray {
+            val out = ByteArray(OffGridProtocol.GATT_FRAME_HEADER_BYTES + payload.size)
+            out[0] = OffGridProtocol.GATT_FRAME_MAGIC
+            out[1] = type
+            out[2] = ((payload.size ushr 8) and 0xFF).toByte()
+            out[3] = (payload.size and 0xFF).toByte()
+            System.arraycopy(payload, 0, out, OffGridProtocol.GATT_FRAME_HEADER_BYTES, payload.size)
+            return out
         }
     }
 }

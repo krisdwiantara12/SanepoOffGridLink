@@ -1,15 +1,19 @@
 package com.sanepo.offgrid.ui
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.LayoutInflater
@@ -27,6 +31,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.Insets
+import androidx.core.location.LocationManagerCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -74,6 +79,10 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
     private lateinit var tvSosBannerText: TextView
     private lateinit var btnSosBannerAction: Button
     private lateinit var bannerPermission: View
+    private lateinit var bannerHardwareToggle: View
+    private lateinit var tvHardwareToggleInfo: TextView
+    private lateinit var btnEnableBtQuick: Button
+    private lateinit var btnEnableLocQuick: Button
 
     private lateinit var panelRadio: View
     private lateinit var panelRadar: View
@@ -285,9 +294,15 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             else -> "SIAGA DENGAR : Tahan PTT atau tekan Kunci Mic untuk berbicara"
         }
 
-        val bleTag = if (snapshot.bleAdvertising || snapshot.bleScanning) "Aktif" else if (snapshot.bleEnabled) "Siap" else "Mati"
+        val btLinkText = when {
+            snapshot.bleGattConnectedCount > 0 -> "BT+ (${snapshot.bleGattConnectedCount})"
+            snapshot.bleAdvertising || snapshot.bleScanning -> "BLE Aktif"
+            snapshot.bleEnabled -> "Siap"
+            else -> "Mati"
+        }
         val lanTag = snapshot.localLanIps.firstOrNull() ?: "-"
-        tvRadioTransportSummary.text = "BLE: $bleTag | P2P: ${snapshot.wifiDirectRole} | IP: $lanTag"
+        tvRadioTransportSummary.text = "$btLinkText | P2P: ${snapshot.wifiDirectRole} | IP: $lanTag"
+        updateHardwareBanner(snapshot)
 
         tvLatchLabel.text = if (snapshot.isPttLatched) "Kunci Mic: AKTIF" else "Kunci Mic: MATI"
         btnPttLatch.setBackgroundResource(if (snapshot.isPttLatched) R.drawable.bg_accent_btn else R.drawable.bg_keycap_btn)
@@ -334,7 +349,7 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         val ipText = if (snapshot.localLanIps.isEmpty()) "Tidak ada Wi-Fi/Hotspot aktif" else snapshot.localLanIps.joinToString(", ")
         tvNodeDiagnostics.text = buildString {
             appendLine("Node ID: ${snapshot.localNodeId} (${snapshot.localCallsign})")
-            appendLine("BLE: ${snapshot.bleStatusDetail}")
+            appendLine("BLE: ${snapshot.bleStatusDetail} | GATT Aktif: ${snapshot.bleGattConnectedCount}")
             appendLine("Wi-Fi Direct: ${snapshot.wifiDirectRole} | ${snapshot.wifiDirectDetail}")
             appendLine("IP Lokal: $ipText")
             append("Socket TCP Terhubung: ${snapshot.connectedTcpSockets} | Baterai: ${snapshot.batteryPercent}%")
@@ -378,6 +393,10 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
         tvSosBannerText = findViewById(R.id.tvSosBannerText)
         btnSosBannerAction = findViewById(R.id.btnSosBannerAction)
         bannerPermission = findViewById(R.id.bannerPermission)
+        bannerHardwareToggle = findViewById(R.id.bannerHardwareToggle)
+        tvHardwareToggleInfo = findViewById(R.id.tvHardwareToggleInfo)
+        btnEnableBtQuick = findViewById(R.id.btnEnableBtQuick)
+        btnEnableLocQuick = findViewById(R.id.btnEnableLocQuick)
 
         panelRadio = findViewById(R.id.panelRadio)
         panelRadar = findViewById(R.id.panelRadar)
@@ -495,6 +514,17 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
 
         findViewById<Button>(R.id.btnGrantPermissions).setOnClickListener {
             requestMissingPermissionsIfNeeded(initialLaunch = false)
+        }
+
+        btnEnableBtQuick.setOnClickListener {
+            openBluetoothEnablePrompt()
+        }
+
+        btnEnableLocQuick.setOnClickListener {
+            try {
+                startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+            } catch (_: Throwable) {
+            }
         }
 
         // Tactile Push-To-Talk Dome (Touch + Keyboard Enter/Space accessibility)
@@ -753,6 +783,47 @@ class MainActivity : AppCompatActivity(), MeshRepository.Observer {
             !PermissionHelper.hasWifiDirectPermission(this) ||
             !PermissionHelper.hasLocationPermission(this)
         bannerPermission.visibility = if (criticalMissing) View.VISIBLE else View.GONE
+        updateHardwareBanner(MeshRepository.getSnapshot())
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openBluetoothEnablePrompt() {
+        try {
+            if (PermissionHelper.hasBleConnectPermission(this)) {
+                startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            } else {
+                startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+            }
+        } catch (_: Throwable) {
+            try {
+                startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun updateHardwareBanner(snapshot: MeshStatusSnapshot) {
+        if (bannerPermission.visibility == View.VISIBLE) {
+            bannerHardwareToggle.visibility = View.GONE
+            return
+        }
+        val btAdapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+        val btOn = btAdapter?.isEnabled == true || snapshot.bleEnabled
+        val locMgr = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        val locOn = locMgr != null && LocationManagerCompat.isLocationEnabled(locMgr)
+
+        if (!btOn || !locOn) {
+            bannerHardwareToggle.visibility = View.VISIBLE
+            btnEnableBtQuick.visibility = if (!btOn && btAdapter != null) View.VISIBLE else View.GONE
+            btnEnableLocQuick.visibility = if (!locOn) View.VISIBLE else View.GONE
+            tvHardwareToggleInfo.text = when {
+                !btOn && !locOn -> "Bluetooth & Lokasi HP mati. Nyalakan keduanya agar terhubung otomatis tanpa Wi-Fi."
+                !btOn -> "Bluetooth mati. Nyalakan Bluetooth untuk koneksi langsung tanpa Wi-Fi."
+                else -> "Lokasi (GPS) HP mati. Android mewajibkan Lokasi aktif untuk pindai Bluetooth & Wi-Fi Direct."
+            }
+        } else {
+            bannerHardwareToggle.visibility = View.GONE
+        }
     }
 
     private fun checkSilentOtaBadge() {

@@ -13,8 +13,10 @@ import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.TreeMap
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.sin
@@ -22,13 +24,16 @@ import kotlin.math.sqrt
 
 class PttAudioEngine(
     private val context: Context,
-    private val onSendAudioFrame: (ByteArray) -> Unit,
+    private val onSendIpAudioFrame: (ByteArray) -> Unit,
+    private val onSendBleAudioFrame: (ByteArray) -> Unit,
+    private val hasIpTransportPeers: () -> Boolean,
+    private val hasBleGattPeers: () -> Boolean,
     private val onSendPttFloor: (speaking: Boolean) -> Unit
 ) {
     companion object {
         const val SAMPLE_RATE_HZ = 16_000
-        const val FRAME_SAMPLES = 320 // 20 ms
-        const val FRAME_BYTES = FRAME_SAMPLES * 2 // 640 bytes 16-bit PCM
+        const val FRAME_SAMPLES = 640 // 40 ms @ 16 kHz (25 packets/sec for rock-solid jitter stability)
+        const val FRAME_BYTES = FRAME_SAMPLES * 2 // 1280 bytes raw PCM per 40 ms
 
         fun computeNormalizedRms(pcmBytes: ByteArray, length: Int = pcmBytes.size): Float {
             val samples = length / 2
@@ -38,12 +43,12 @@ class PttAudioEngine(
             while (i + 1 < length) {
                 val lo = pcmBytes[i].toInt() and 0xFF
                 val hi = pcmBytes[i + 1].toInt()
-                val sample = (hi shl 8) or lo
+                val sample = ((hi shl 8) or lo).toShort().toInt()
                 sumSq += sample.toDouble() * sample.toDouble()
                 i += 2
             }
             val rms = sqrt(sumSq / samples)
-            return (rms / 9000.0).toFloat().coerceIn(0f, 1f)
+            return (rms / 8500.0).toFloat().coerceIn(0f, 1f)
         }
 
         fun synthesizeRogerBeepPcm(): ByteArray {
@@ -79,11 +84,28 @@ class PttAudioEngine(
         }
     }
 
+    private data class QueuedPcmFrame(
+        val sequence: Int,
+        val senderId: String,
+        val senderName: String,
+        val pcmBytes: ByteArray,
+        val isRoger: Boolean
+    )
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-    private var audioTrack: AudioTrack? = null
-    private var rxWatchdogPosted = false
+
+    private val rxLock = Object()
+    private val jitterBuffer = TreeMap<Int, QueuedPcmFrame>()
+    private var expectedNextSeq: Int? = null
+    private var burstStartWaitMs: Long = 0L
+    private var prebuffering = true
     private var lastRxPacketMs = 0L
+    private var lastRxUiNotifyMs = 0L
+
+    private var audioTrack: AudioTrack? = null
+    private var playbackThread: Thread? = null
+    private var playbackRunning = false
 
     @Volatile
     private var transmitting = false
@@ -97,9 +119,13 @@ class PttAudioEngine(
     private val rogerBeepBytes: ByteArray by lazy { synthesizeRogerBeepPcm() }
 
     private val rxTimeoutRunnable = Runnable {
-        rxWatchdogPosted = false
         val elapsed = System.currentTimeMillis() - lastRxPacketMs
-        if (elapsed >= 2200L) {
+        if (elapsed >= 1800L) {
+            synchronized(rxLock) {
+                jitterBuffer.clear()
+                expectedNextSeq = null
+                prebuffering = true
+            }
             MeshRepository.updateSnapshot(forceImmediate = true) {
                 if (activeTalkerId != null) {
                     copy(activeTalkerId = null, activeTalkerCallsign = null, rxLevelNormalized = 0f)
@@ -111,13 +137,104 @@ class PttAudioEngine(
     }
 
     fun startPlayback() {
+        if (playbackRunning) return
         ensureAudioTrack()
+        playbackRunning = true
+        val thread = Thread({
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            } catch (_: Throwable) {
+            }
+            while (playbackRunning && !Thread.currentThread().isInterrupted) {
+                var frameToPlay: QueuedPcmFrame? = null
+                synchronized(rxLock) {
+                    if (jitterBuffer.isEmpty()) {
+                        prebuffering = true
+                        burstStartWaitMs = 0L
+                        try {
+                            rxLock.wait(250L)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
+                    } else {
+                        if (prebuffering) {
+                            val waited = System.currentTimeMillis() - burstStartWaitMs
+                            if (jitterBuffer.size >= 2 || waited >= 95L) {
+                                prebuffering = false
+                            } else {
+                                try {
+                                    rxLock.wait(15L)
+                                } catch (_: InterruptedException) {
+                                    break
+                                }
+                            }
+                        }
+                        if (!prebuffering && jitterBuffer.isNotEmpty()) {
+                            val firstKey = jitterBuffer.firstKey()
+                            val exp = expectedNextSeq
+                            if (exp != null && firstKey > exp && jitterBuffer.size < 3) {
+                                // Small 15ms wait for one slightly delayed out-of-order UDP packet before skipping gap
+                                try {
+                                    rxLock.wait(15L)
+                                } catch (_: InterruptedException) {
+                                    break
+                                }
+                            }
+                            val nextKey = if (jitterBuffer.isNotEmpty()) jitterBuffer.firstKey() else null
+                            if (nextKey != null) {
+                                frameToPlay = jitterBuffer.remove(nextKey)
+                                expectedNextSeq = nextKey + 1
+                            }
+                        }
+                    }
+                }
+
+                val item = frameToPlay ?: continue
+                if (transmitting) continue
+
+                val track = ensureAudioTrack() ?: continue
+                try {
+                    if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                        track.play()
+                    }
+                    if (item.isRoger) {
+                        track.write(rogerBeepBytes, 0, rogerBeepBytes.size)
+                        MeshRepository.updateSnapshot(forceImmediate = true) {
+                            copy(activeTalkerId = null, activeTalkerCallsign = null, rxLevelNormalized = 0f)
+                        }
+                    } else if (item.pcmBytes.isNotEmpty()) {
+                        track.write(item.pcmBytes, 0, item.pcmBytes.size)
+                        val now = System.currentTimeMillis()
+                        if (now - lastRxUiNotifyMs >= 90L) {
+                            lastRxUiNotifyMs = now
+                            val level = computeNormalizedRms(item.pcmBytes)
+                            MeshRepository.updateSnapshot(forceImmediate = false) {
+                                copy(
+                                    activeTalkerId = item.senderId,
+                                    activeTalkerCallsign = item.senderName,
+                                    rxLevelNormalized = level
+                                )
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }, "SanepoAudioRx")
+        playbackThread = thread
+        thread.start()
     }
 
     fun stopAll() {
         stopTransmitting(sendRoger = false)
         mainHandler.removeCallbacks(rxTimeoutRunnable)
-        rxWatchdogPosted = false
+        playbackRunning = false
+        synchronized(rxLock) {
+            jitterBuffer.clear()
+            rxLock.notifyAll()
+        }
+        playbackThread?.interrupt()
+        playbackThread = null
         try {
             audioTrack?.pause()
             audioTrack?.flush()
@@ -151,7 +268,7 @@ class PttAudioEngine(
             return false
         }
 
-        val recBufSize = maxOf(minBuf * 2, FRAME_BYTES * 8)
+        val recBufSize = maxOf(minBuf * 3, FRAME_BYTES * 6)
         val recorder = try {
             val source = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION
@@ -197,15 +314,22 @@ class PttAudioEngine(
         } else null
 
         transmitting = true
-        playLocalCue(rogerBeepBytes)
+        playImmediateCue(rogerBeepBytes)
         onSendPttFloor(true)
         MeshRepository.updateSnapshot(forceImmediate = true) {
             copy(isLocalTransmitting = true, lastError = null)
         }
 
         val thread = Thread({
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            } catch (_: Throwable) {
+            }
             val frameBuf = ByteArray(FRAME_BYTES)
+            val adpcmState16 = ImaAdpcmCodec.EncoderState()
+            val adpcmState8 = ImaAdpcmCodec.EncoderState()
             var lastMeterUiMs = 0L
+
             try {
                 recorder.startRecording()
                 while (transmitting && !Thread.currentThread().isInterrupted) {
@@ -221,17 +345,35 @@ class PttAudioEngine(
                     if (!transmitting || offset <= 0) break
 
                     val snap = MeshRepository.getSnapshot()
-                    val pkt = OffGridProtocol.encodeAudioFrame(
-                        type = OffGridProtocol.AUDIO_TYPE_PCM,
+                    val seq = ++txSequence
+
+                    // Compact 4:1 ADPCM @ 16kHz (~8 KB/s) over Wi-Fi Direct / LAN UDP
+                    val adpcm16 = ImaAdpcmCodec.encodePcm16Le(frameBuf, offset, adpcmState16)
+                    val wifiPkt = OffGridProtocol.encodeAudioFrame(
+                        type = OffGridProtocol.AUDIO_TYPE_ADPCM_16K,
                         channelNumber = snap.channelNumber,
                         senderNodeId = snap.localNodeId,
-                        sequence = ++txSequence,
-                        pcmBytes = if (offset == FRAME_BYTES) frameBuf else frameBuf.copyOf(offset)
+                        sequence = seq,
+                        pcmBytes = adpcm16
                     )
-                    onSendAudioFrame(pkt)
+                    onSendIpAudioFrame(wifiPkt)
+
+                    // Fallback 8kHz ADPCM (~4 KB/s) over Bluetooth LE GATT when no Wi-Fi IP peer is active
+                    if (!hasIpTransportPeers() && hasBleGattPeers()) {
+                        val pcm8k = ImaAdpcmCodec.downsample16kTo8k(frameBuf, offset)
+                        val adpcm8 = ImaAdpcmCodec.encodePcm16Le(pcm8k, pcm8k.size, adpcmState8)
+                        val blePkt = OffGridProtocol.encodeAudioFrame(
+                            type = OffGridProtocol.AUDIO_TYPE_ADPCM_8K,
+                            channelNumber = snap.channelNumber,
+                            senderNodeId = snap.localNodeId,
+                            sequence = seq,
+                            pcmBytes = adpcm8
+                        )
+                        onSendBleAudioFrame(blePkt)
+                    }
 
                     val now = System.currentTimeMillis()
-                    if (now - lastMeterUiMs >= 60L) {
+                    if (now - lastMeterUiMs >= 80L) {
                         lastMeterUiMs = now
                         val level = computeNormalizedRms(frameBuf, offset)
                         MeshRepository.updateSnapshot(forceImmediate = true) {
@@ -272,7 +414,7 @@ class PttAudioEngine(
 
         val snap = MeshRepository.getSnapshot()
         if (sendRoger) {
-            playLocalCue(rogerBeepBytes)
+            playImmediateCue(rogerBeepBytes)
             val rogerPkt = OffGridProtocol.encodeAudioFrame(
                 type = OffGridProtocol.AUDIO_TYPE_ROGER,
                 channelNumber = snap.channelNumber,
@@ -280,7 +422,10 @@ class PttAudioEngine(
                 sequence = ++txSequence,
                 pcmBytes = ByteArray(0)
             )
-            onSendAudioFrame(rogerPkt)
+            onSendIpAudioFrame(rogerPkt)
+            if (!hasIpTransportPeers() && hasBleGattPeers()) {
+                onSendBleAudioFrame(rogerPkt)
+            }
         }
         onSendPttFloor(false)
         MeshRepository.updateSnapshot(forceImmediate = true) {
@@ -292,48 +437,50 @@ class PttAudioEngine(
         val snap = MeshRepository.getSnapshot()
         if (frame.senderNodeId == snap.localNodeId) return
         if (frame.channelNumber != snap.channelNumber && !snap.localSosActive) return
-        if (transmitting) return // Simplex priority: ignore echo while holding TX
+        if (transmitting) return
 
         lastRxPacketMs = System.currentTimeMillis()
-        scheduleRxTimeout()
+        mainHandler.removeCallbacks(rxTimeoutRunnable)
+        mainHandler.postDelayed(rxTimeoutRunnable, 1900L)
 
         val peerName = MeshRepository.getPeersSorted()
             .firstOrNull { it.nodeId == frame.senderNodeId }?.callsign ?: frame.senderNodeId.take(6)
 
-        if (frame.type == OffGridProtocol.AUDIO_TYPE_ROGER) {
-            playLocalCue(rogerBeepBytes)
-            MeshRepository.updateSnapshot(forceImmediate = true) {
-                copy(activeTalkerId = null, activeTalkerCallsign = null, rxLevelNormalized = 0f)
+        val decodedPcm: ByteArray = when (frame.type) {
+            OffGridProtocol.AUDIO_TYPE_ROGER -> ByteArray(0)
+            OffGridProtocol.AUDIO_TYPE_ADPCM_16K -> ImaAdpcmCodec.decodeToPcm16Le(frame.pcmBytes)
+            OffGridProtocol.AUDIO_TYPE_ADPCM_8K -> {
+                val pcm8k = ImaAdpcmCodec.decodeToPcm16Le(frame.pcmBytes)
+                ImaAdpcmCodec.upsample8kTo16k(pcm8k)
             }
-            return
+            OffGridProtocol.AUDIO_TYPE_PCM -> frame.pcmBytes
+            else -> return
         }
 
-        if (frame.pcmBytes.isEmpty()) return
-        val track = ensureAudioTrack() ?: return
-        try {
-            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                track.play()
+        val isRoger = (frame.type == OffGridProtocol.AUDIO_TYPE_ROGER)
+        if (!isRoger && decodedPcm.isEmpty()) return
+
+        synchronized(rxLock) {
+            if (jitterBuffer.isEmpty()) {
+                burstStartWaitMs = System.currentTimeMillis()
+                prebuffering = true
+                expectedNextSeq = frame.sequence
             }
-            track.write(frame.pcmBytes, 0, frame.pcmBytes.size)
-            val rxLevel = computeNormalizedRms(frame.pcmBytes)
-            MeshRepository.updateSnapshot(forceImmediate = false) {
-                copy(
-                    activeTalkerId = frame.senderNodeId,
-                    activeTalkerCallsign = peerName,
-                    rxLevelNormalized = rxLevel
-                )
+            if (jitterBuffer.size >= 14) {
+                jitterBuffer.remove(jitterBuffer.firstKey())
             }
-        } catch (_: Throwable) {
+            jitterBuffer[frame.sequence] = QueuedPcmFrame(
+                sequence = frame.sequence,
+                senderId = frame.senderNodeId,
+                senderName = peerName,
+                pcmBytes = decodedPcm,
+                isRoger = isRoger
+            )
+            rxLock.notifyAll()
         }
     }
 
-    private fun scheduleRxTimeout() {
-        mainHandler.removeCallbacks(rxTimeoutRunnable)
-        rxWatchdogPosted = true
-        mainHandler.postDelayed(rxTimeoutRunnable, 2300L)
-    }
-
-    private fun playLocalCue(pcm: ByteArray) {
+    private fun playImmediateCue(pcm: ByteArray) {
         val track = ensureAudioTrack() ?: return
         try {
             if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
@@ -369,7 +516,7 @@ class PttAudioEngine(
             val track = AudioTrack.Builder()
                 .setAudioAttributes(attrs)
                 .setAudioFormat(format)
-                .setBufferSizeInBytes(maxOf(minOut, FRAME_BYTES * 8))
+                .setBufferSizeInBytes(maxOf(minOut * 2, FRAME_BYTES * 6))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
             if (track.state == AudioTrack.STATE_INITIALIZED) {

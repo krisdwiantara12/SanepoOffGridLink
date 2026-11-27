@@ -2,6 +2,7 @@ package com.sanepo.offgrid.model
 
 enum class TransportLinkType(val shortLabel: String) {
     BLE_BEACON("BLE"),
+    BLE_GATT("BT"),
     WIFI_DIRECT("P2P"),
     LOCAL_LAN("LAN")
 }
@@ -82,6 +83,7 @@ data class MeshStatusSnapshot(
     val wifiDirectPeersCount: Int = 0,
     val localLanIps: List<String> = emptyList(),
     val connectedTcpSockets: Int = 0,
+    val bleGattConnectedCount: Int = 0,
     val activeTalkerId: String? = null,
     val activeTalkerCallsign: String? = null,
     val isLocalTransmitting: Boolean = false,

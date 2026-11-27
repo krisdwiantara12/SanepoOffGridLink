@@ -2,6 +2,7 @@ package com.sanepo.offgrid.engine
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
@@ -22,6 +23,8 @@ import androidx.core.content.ContextCompat
 
 class BleBeaconEngine(
     private val context: Context,
+    private val onBeaconSeen: ((BluetoothDevice, OffGridProtocol.BleBeaconPacket, Int) -> Unit)? = null,
+    private val onBluetoothPowerChanged: ((Boolean) -> Unit)? = null,
     private val onRemoteSosTriggered: ((OffGridProtocol.BleBeaconPacket) -> Unit)? = null
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -44,12 +47,14 @@ class BleBeaconEngine(
                 val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
                 when (state) {
                     BluetoothAdapter.STATE_ON -> {
+                        onBluetoothPowerChanged?.invoke(true)
                         if (running) {
                             startScanInternal()
                             restartAdvertiseInternal()
                         }
                     }
                     BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                        onBluetoothPowerChanged?.invoke(false)
                         scanningActive = false
                         advertisingActive = false
                         updateRepoState("Bluetooth mati: aktifkan untuk Radar BLE dan Beacon SOS")
@@ -240,7 +245,7 @@ class BleBeaconEngine(
                 else AdvertiseSettings.ADVERTISE_MODE_BALANCED
             )
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setConnectable(false)
+            .setConnectable(true)
             .build()
 
         val data = AdvertiseData.Builder()
@@ -274,6 +279,9 @@ class BleBeaconEngine(
         val packet = OffGridProtocol.decodeBlePayload(raw) ?: return
         val wasSos = MeshRepository.getPeersSorted().firstOrNull { it.nodeId == packet.nodeId }?.isSos == true
         MeshRepository.upsertPeerFromBle(packet, result.rssi)
+        result.device?.let { dev ->
+            onBeaconSeen?.invoke(dev, packet, result.rssi)
+        }
         if (packet.isSos && !wasSos) {
             onRemoteSosTriggered?.invoke(packet)
         }

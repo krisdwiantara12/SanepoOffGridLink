@@ -13,6 +13,7 @@ import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
+import android.os.Build
 import android.os.Looper
 import androidx.core.content.ContextCompat
 import com.sanepo.offgrid.model.WifiDirectDiscoveredPeer
@@ -39,6 +40,7 @@ class LocalMeshTransport(
     private val onRemoteSosReceived: (OffGridProtocol.ControlEnvelope.SosSignal) -> Unit
 ) {
     private val executor: ExecutorService = Executors.newCachedThreadPool()
+    private val audioTxExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
     private val p2pManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
     private var p2pChannel: WifiP2pManager.Channel? = null
@@ -47,6 +49,7 @@ class LocalMeshTransport(
     private var receiverRegistered = false
     private var localServiceRegistered = false
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private var tcpServerSocket: ServerSocket? = null
     private var udpDiscoverySocket: DatagramSocket? = null
@@ -54,6 +57,9 @@ class LocalMeshTransport(
 
     private val clientHandlers = ConcurrentHashMap<String, ClientConnection>()
     private val peerUdpTargets = ConcurrentHashMap<String, String>() // nodeId -> ipAddress
+    private val cachedPeerInetAddrs = ConcurrentHashMap<String, InetAddress>()
+    @Volatile
+    private var cachedBroadcastAddrs: List<InetAddress> = emptyList()
     private val txtMetadataByMac = ConcurrentHashMap<String, Map<String, String>>()
     private val latestP2pDevices = ConcurrentHashMap<String, WifiP2pDevice>()
     private var p2pServiceInfo: WifiP2pDnsSdServiceInfo? = null
@@ -111,9 +117,20 @@ class LocalMeshTransport(
                 setReferenceCounted(false)
                 acquire()
             }
+            @Suppress("DEPRECATION")
+            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wifiManager?.createWifiLock(lockMode, "SanepoWifiLatencyLock")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
         } catch (_: Throwable) {
         }
 
+        cachedBroadcastAddrs = enumerateBroadcastAddresses()
         MeshRepository.updateSnapshot(forceImmediate = true) {
             copy(
                 wifiDirectSupported = p2pSupported,
@@ -128,8 +145,7 @@ class LocalMeshTransport(
         startBeaconHeartbeatLoop()
 
         if (p2pSupported) {
-            registerDnsSdService()
-            discoverPeersAndServices()
+            registerDnsSdService(discoverAfter = true)
         }
     }
 
@@ -139,6 +155,10 @@ class LocalMeshTransport(
         unregisterDnsSdService()
         try {
             multicastLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Throwable) {
+        }
+        try {
+            wifiLock?.takeIf { it.isHeld }?.release()
         } catch (_: Throwable) {
         }
         try {
@@ -309,19 +329,20 @@ class LocalMeshTransport(
         }
     }
 
+    fun hasNetworkPeers(): Boolean = clientHandlers.isNotEmpty() || peerUdpTargets.isNotEmpty()
+
     fun sendAudioFrameToPeers(packetBytes: ByteArray) {
-        executor.execute {
-            val targets = peerUdpTargets.values.toSet()
+        audioTxExecutor.execute {
             val socket = udpAudioSocket ?: return@execute
-            for (ip in targets) {
+            val targetAddrs = cachedPeerInetAddrs.values
+            for (addr in targetAddrs) {
                 try {
-                    val addr = InetAddress.getByName(ip)
                     socket.send(DatagramPacket(packetBytes, packetBytes.size, addr, OffGridProtocol.UDP_AUDIO_PORT))
                 } catch (_: Throwable) {
                 }
             }
-            if (targets.isEmpty() || !isP2pGroupOwner) {
-                for (bcast in enumerateBroadcastAddresses()) {
+            if (targetAddrs.isEmpty()) {
+                for (bcast in cachedBroadcastAddrs) {
                     try {
                         socket.send(DatagramPacket(packetBytes, packetBytes.size, bcast, OffGridProtocol.UDP_AUDIO_PORT))
                     } catch (_: Throwable) {
@@ -425,9 +446,9 @@ class LocalMeshTransport(
                         val copy = pkt.data.copyOf(pkt.length)
                         for ((nodeId, targetIp) in peerUdpTargets) {
                             if (targetIp != remoteIp && nodeId != frame.senderNodeId) {
+                                val cachedAddr = cachedPeerInetAddrs[nodeId] ?: continue
                                 try {
-                                    val addr = InetAddress.getByName(targetIp)
-                                    sock.send(DatagramPacket(copy, copy.size, addr, OffGridProtocol.UDP_AUDIO_PORT))
+                                    sock.send(DatagramPacket(copy, copy.size, cachedAddr, OffGridProtocol.UDP_AUDIO_PORT))
                                 } catch (_: Throwable) {
                                 }
                             }
@@ -443,20 +464,27 @@ class LocalMeshTransport(
 
     private fun startBeaconHeartbeatLoop() {
         executor.execute {
+            var cycle = 0
             while (running) {
                 try {
+                    cachedBroadcastAddrs = enumerateBroadcastAddresses()
                     val hello = buildLocalHelloEnvelope()
                     val json = OffGridProtocol.encodeControlJson(hello)
                     broadcastUdpControl(json)
                     for (client in clientHandlers.values) {
                         client.sendLine(json)
                     }
+                    val wifiOn = wifiManager?.isWifiEnabled == true
                     val lans = enumerateLocalIpv4Addresses()
                     MeshRepository.updateSnapshot(forceImmediate = false) {
                         copy(
-                            wifiEnabled = wifiManager?.isWifiEnabled == true,
+                            wifiEnabled = wifiOn,
                             localLanIps = lans
                         )
+                    }
+                    cycle++
+                    if (wifiOn && cycle % 7 == 0 && clientHandlers.isEmpty() && PermissionHelper.hasWifiDirectPermission(context)) {
+                        discoverPeersAndServices()
                     }
                     Thread.sleep(3000L)
                 } catch (_: InterruptedException) {
@@ -492,7 +520,7 @@ class LocalMeshTransport(
         when (env) {
             is OffGridProtocol.ControlEnvelope.Hello -> {
                 if (env.nodeId == localId) return
-                peerUdpTargets[env.nodeId] = remoteIp
+                rememberPeerUdpTarget(env.nodeId, remoteIp)
                 MeshRepository.upsertPeerFromNetwork(env, remoteIp, viaWifiDirect = viaP2p)
                 if (sourceKey == null && localId > env.nodeId) {
                     connectTcpToIpIfNeeded(remoteIp)
@@ -502,7 +530,7 @@ class LocalMeshTransport(
             }
             is OffGridProtocol.ControlEnvelope.Chat -> {
                 if (env.senderId == localId) return
-                peerUdpTargets[env.senderId] = remoteIp
+                rememberPeerUdpTarget(env.senderId, remoteIp)
                 val isNew = MeshRepository.appendIncomingMessage(env)
                 if (isNew) {
                     val ack = OffGridProtocol.ControlEnvelope.ChatAck(msgId = env.msgId, receiverId = localId)
@@ -525,7 +553,7 @@ class LocalMeshTransport(
             }
             is OffGridProtocol.ControlEnvelope.SosSignal -> {
                 if (env.senderId != localId) {
-                    peerUdpTargets[env.senderId] = remoteIp
+                    rememberPeerUdpTarget(env.senderId, remoteIp)
                     MeshRepository.updatePeerSosState(env, remoteIp)
                     onRemoteSosReceived(env)
                     relayControlJsonIfGroupOwner(raw, sourceKey)
@@ -604,8 +632,17 @@ class LocalMeshTransport(
         MeshRepository.replaceWifiDirectDiscoveredPeers(list)
     }
 
+    private fun rememberPeerUdpTarget(nodeId: String, remoteIp: String) {
+        if (peerUdpTargets[nodeId] == remoteIp && cachedPeerInetAddrs.containsKey(nodeId)) return
+        peerUdpTargets[nodeId] = remoteIp
+        try {
+            cachedPeerInetAddrs[nodeId] = InetAddress.getByName(remoteIp)
+        } catch (_: Throwable) {
+        }
+    }
+
     @SuppressLint("MissingPermission")
-    private fun registerDnsSdService() {
+    private fun registerDnsSdService(discoverAfter: Boolean = false) {
         val mgr = p2pManager ?: return
         val ch = p2pChannel ?: return
         if (!PermissionHelper.hasWifiDirectPermission(context)) return
@@ -626,16 +663,26 @@ class LocalMeshTransport(
                 mgr.addLocalService(ch, info, object : WifiP2pManager.ActionListener {
                     override fun onSuccess() {
                         localServiceRegistered = true
+                        if (discoverAfter && running) discoverPeersAndServices()
                     }
 
                     override fun onFailure(reason: Int) {
                         localServiceRegistered = false
+                        if (discoverAfter && running) discoverPeersAndServices()
                     }
                 })
             }
 
             override fun onFailure(reason: Int) {
-                mgr.addLocalService(ch, info, null)
+                mgr.addLocalService(ch, info, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        if (discoverAfter && running) discoverPeersAndServices()
+                    }
+
+                    override fun onFailure(reason: Int) {
+                        if (discoverAfter && running) discoverPeersAndServices()
+                    }
+                })
             }
         })
     }

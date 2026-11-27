@@ -1,12 +1,12 @@
 {
-  "tagName": "v1.0.0",
-  "releaseName": "Sanepo OffGrid Link v1.0.0",
-  "body": "Rilis perdana Sanepo OffGrid Link: Walkie-Talkie PTT P2P, Radar Kompas GNSS + RSSI BLE, Chat Cepat Offline, Beacon SOS Flash Morse & Sirine, Dual Tema Siang/Malam, dan Auto-OTA GitHub.",
-  "publishedAt": "2026-11-27T12:13:00Z",
+  "tagName": "v1.0.1",
+  "releaseName": "Sanepo OffGrid Link v1.0.1",
+  "body": "v1.0.1: Koneksi otomatis Bluetooth LE GATT tanpa Wi-Fi sama sekali + kompresi suara ADPCM 4:1, Jitter Buffer & WifiLock agar suara Wi-Fi lancar tanpa putus-putus.",
+  "publishedAt": "2026-11-27T13:10:00Z",
   "htmlUrl": "https://github.com/krisdwiantara12/SanepoOffGridLink/releases",
   "isPreRelease": false,
-  "apkAssetName": "SanepoOffGridLink-v1.0.0.apk",
-  "apkDownloadUrl": "https://raw.githubusercontent.com/krisdwiantara12/SanepoOffGridLink/main/releases/SanepoOffGridLink-v1.0.0.apk",
-  "apkSizeBytes": 884461,
-  "expectedSha256": "e13da148b7e028c5d30ac4c2599a58654c3ecf7ce57942abf9e7737987c71115"
+  "apkAssetName": "SanepoOffGridLink-v1.0.1.apk",
+  "apkDownloadUrl": "https://raw.githubusercontent.com/krisdwiantara12/SanepoOffGridLink/main/releases/SanepoOffGridLink-v1.0.1.apk",
+  "apkSizeBytes": 898093,
+  "expectedSha256": "d8de121ec8c4ff7a9fb78b088032565d855991c55cb1f967042bf6a47c4e0d17"
 }
